@@ -1,0 +1,13 @@
+[package]
+name = "systemd-manager"
+version = "0.1.0"
+edition = "2021"
+description = "A GTK4/libadwaita desktop app for managing systemd services"
+license = "MIT"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+async-channel = "2"
+serde = "1"

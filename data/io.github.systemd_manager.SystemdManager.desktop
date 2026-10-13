@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Systemd Manager
+GenericName=Service Manager
+Comment=Start, stop, enable and inspect systemd services
+Exec=systemd-manager
+Icon=io.github.systemd_manager.SystemdManager
+Terminal=false
+Categories=GTK;GNOME;System;Settings;
+Keywords=systemd;service;daemon;unit;journal;log;systemctl;
+StartupNotify=true
