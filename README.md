@@ -11,7 +11,7 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 - Switches between **System** services and your own **User** services.
 - **Start, Stop, Restart, Reload, Enable, Disable, Mask, Unmask**. On system services, the polkit password prompt appears when systemd needs it.
 - **Status** shows active/sub state, unit file state, main PID, memory, active since, and the unit file path.
-- **Journal** shows the last 100 to 10,000 lines for the unit, and can **Follow** new lines live.
+- **Journal** streams the unit's log live, starting from the last 100 to 10,000 lines. **Pause** freezes the view and keeps new lines until you **Resume**. **Find in log** highlights every match; Enter and Shift+Enter (or the arrows) jump between them.
 - **Unit File** lets you view and edit the unit, then **Save and Reload**, which writes the file and runs daemon-reload. Vendor units (e.g. under `/usr/lib/systemd`) are never modified in place. Saving one writes an override copy to `/etc/systemd/system/` (or `~/.config/systemd/user/`).
 - **New service** (the + button) creates a `.service` unit from a form (command, type, restart policy, working directory, user, WantedBy). It can also enable and start the service right away.
 
@@ -39,8 +39,9 @@ sudo pacman -S base-devel gtk4 libadwaita
 ```sh
 ./install.sh            # for all users, into /usr/local (asks for sudo)
 ./install.sh --user     # just for you, into ~/.local (no sudo)
-./install.sh --uninstall          # remove (add --user if you installed with --user)
 ```
+
+To remove it, run `bash uninstall.sh`. It finds every installed copy (in `~/.local`, `/usr/local` or `/usr`), lists what it will delete and asks first. Add `-y` to skip the question, or `--purge` to also delete the `target/` build output. Services you created with the app are left alone.
 
 The script installs missing build dependencies with your package manager (apt, dnf, pacman or zypper), updates Rust through rustup if it is too old, builds a release binary, and installs it with a desktop entry and icon, so Systemd Manager shows up in your app menu. If the file isn't executable after unpacking, run it as `bash install.sh`.
 
@@ -59,7 +60,7 @@ Run the tests with `cargo test`.
 | Piece | File | Notes |
 | --- | --- | --- |
 | systemd API | `src/systemd.rs` | Talks to `org.freedesktop.systemd1` over D-Bus with `zbus`, and listens for its change signals. Privileged calls set the *allow interactive authorization* flag so polkit can prompt. |
-| Journal | `src/journal.rs` | Runs `journalctl -u <unit>` (with `--user` for user services, and `-f` when following) and streams its output into the view. |
+| Journal | `src/journal.rs` | Runs `journalctl -f -u <unit>` (with `--user` for user services) and streams its output into the view. |
 | Main window | `src/window.rs` | Holds the list, the status, journal and unit file tabs, and the action buttons. D-Bus calls run on worker threads, so the UI never blocks. |
 | New service dialog | `src/new_service.rs` | Renders the form into a unit file, writes it, runs daemon-reload, then optionally enables and starts it. |
 

@@ -9,3 +9,4 @@ Terminal=false
 Categories=GTK;GNOME;System;Settings;
 Keywords=systemd;service;daemon;unit;journal;log;systemctl;
 StartupNotify=true
+StartupWMClass=io.github.systemd_manager.SystemdManager

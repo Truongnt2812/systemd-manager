@@ -11,3 +11,18 @@ adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 async-channel = "2"
 serde = "1"
+
+[package.metadata.deb]
+maintainer = "Truong Nguyen <truongntwork@gmail.com>"
+section = "admin"
+depends = "$auto, policykit-1 | polkitd"
+extended-description = "GTK4 app for managing systemd services."
+maintainer-scripts = "debian/"
+assets = [
+  ["target/release/systemd-manager", "usr/bin/", "755"],
+  ["data/io.github.systemd_manager.SystemdManager.desktop", "usr/share/applications/", "644"],
+  ["data/io.github.systemd_manager.SystemdManager.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+  ["data/icons/48x48.png", "usr/share/icons/hicolor/48x48/apps/io.github.systemd_manager.SystemdManager.png", "644"],
+  ["data/icons/256x256.png", "usr/share/icons/hicolor/256x256/apps/io.github.systemd_manager.SystemdManager.png", "644"],
+  ["README.md", "usr/share/doc/systemd-manager/", "644"],
+]

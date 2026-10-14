@@ -67,7 +67,8 @@ refresh_caches() {
 
 if [[ $UNINSTALL -eq 1 ]]; then
     say "Removing Systemd Manager from $PREFIX"
-    $SUDO rm -f "$BIN_PATH" "$DESKTOP_PATH" "$ICON_PATH"
+    $SUDO rm -f "$BIN_PATH" "$DESKTOP_PATH" "$ICON_PATH" \
+        "$ICON_DIR/48x48/apps/$APP_ID.png" "$ICON_DIR/256x256/apps/$APP_ID.png"
     refresh_caches
     say "Uninstalled."
     exit 0
@@ -133,6 +134,9 @@ say "Building (release)"
 say "Installing into $PREFIX"
 $SUDO install -Dm755 "$SRC_DIR/target/release/$BIN_NAME" "$BIN_PATH"
 $SUDO install -Dm644 "$SRC_DIR/data/$APP_ID.svg" "$ICON_PATH"
+for size in 48x48 256x256; do
+    $SUDO install -Dm644 "$SRC_DIR/data/icons/$size.png" "$ICON_DIR/$size/apps/$APP_ID.png"
+done
 # Use the absolute binary path so the launcher works even if $PREFIX/bin isn't on PATH.
 sed "s|^Exec=.*|Exec=$BIN_PATH|" "$SRC_DIR/data/$APP_ID.desktop" \
     | $SUDO install -Dm644 /dev/stdin "$DESKTOP_PATH"

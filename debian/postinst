@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+# Refresh the icon and app-menu caches so the launcher picks up the new icon
+# right away, even on systems without the dpkg triggers for them.
+if [ "$1" = "configure" ]; then
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q /usr/share/applications || true
+    fi
+fi
+#DEBHELPER#
