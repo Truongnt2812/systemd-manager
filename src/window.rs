@@ -67,7 +67,9 @@ pub struct Window {
     rows: StatusRows,
     buttons: ActionButtons,
     journal_view: gtk::TextView,
-    journal_follow: gtk::ToggleButton,
+    journal_pause: gtk::ToggleButton,
+    journal_search: gtk::SearchEntry,
+    journal_matches_label: gtk::Label,
     journal_lines: gtk::DropDown,
     unit_view: gtk::TextView,
     unit_banner: adw::Banner,
@@ -80,6 +82,9 @@ pub struct Window {
     details: RefCell<Option<Details>>,
     journal: RefCell<Option<JournalStream>>,
     journal_gen: Cell<u64>,
+    /// Lines that arrived while the journal was paused.
+    journal_held: RefCell<String>,
+    journal_matches: Cell<usize>,
     list_gen: Cell<u64>,
     rebuilding: Cell<bool>,
     unit_loading: Cell<bool>,
@@ -350,14 +355,43 @@ impl Window {
             "Last 10000 lines",
         ]);
         journal_lines.set_selected(1);
-        let journal_follow = gtk::ToggleButton::builder()
+        journal_view.buffer().create_tag(
+            Some("match"),
+            &[(
+                "background-rgba",
+                &gtk::gdk::RGBA::new(0.96, 0.76, 0.07, 0.45).to_value(),
+            )],
+        );
+        journal_view.buffer().create_tag(
+            Some("current-match"),
+            &[(
+                "background-rgba",
+                &gtk::gdk::RGBA::new(1.0, 0.47, 0.0, 0.8).to_value(),
+            )],
+        );
+        let journal_pause = gtk::ToggleButton::builder()
             .child(
                 &adw::ButtonContent::builder()
-                    .label("Follow")
-                    .icon_name("media-playback-start-symbolic")
+                    .label("Pause")
+                    .icon_name("media-playback-pause-symbolic")
                     .build(),
             )
-            .tooltip_text("Keep showing new log lines as they arrive")
+            .tooltip_text("Pause the live log; new lines are kept until you resume")
+            .build();
+        let journal_search = gtk::SearchEntry::builder()
+            .placeholder_text("Find in log")
+            .hexpand(true)
+            .build();
+        let journal_matches_label = gtk::Label::builder()
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let journal_prev = gtk::Button::builder()
+            .icon_name("go-up-symbolic")
+            .tooltip_text("Previous match (Shift+Enter)")
+            .build();
+        let journal_next = gtk::Button::builder()
+            .icon_name("go-down-symbolic")
+            .tooltip_text("Next match (Enter)")
             .build();
         let journal_reload = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
@@ -371,10 +405,11 @@ impl Window {
             .margin_top(6)
             .margin_bottom(6)
             .build();
-        let spacer = gtk::Box::builder().hexpand(true).build();
         journal_bar.append(&journal_lines);
-        journal_bar.append(&journal_follow);
-        journal_bar.append(&spacer);
+        journal_bar.append(&journal_pause);
+        journal_bar.append(&journal_search);
+        journal_bar.append(&journal_matches_label);
+        journal_bar.append(&linked(&[&journal_prev, &journal_next]));
         journal_bar.append(&journal_reload);
         let journal_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         journal_box.append(&journal_bar);
@@ -504,7 +539,9 @@ impl Window {
             rows,
             buttons,
             journal_view,
-            journal_follow,
+            journal_pause,
+            journal_search,
+            journal_matches_label,
             journal_lines,
             unit_view,
             unit_banner,
@@ -516,6 +553,8 @@ impl Window {
             details: RefCell::new(None),
             journal: RefCell::new(None),
             journal_gen: Cell::new(0),
+            journal_held: RefCell::new(String::new()),
+            journal_matches: Cell::new(0),
             list_gen: Cell::new(0),
             rebuilding: Cell::new(false),
             unit_loading: Cell::new(false),
@@ -607,11 +646,65 @@ impl Window {
         }
 
         let weak = Rc::downgrade(&w);
-        w.journal_follow.connect_toggled(move |_| {
+        w.journal_pause.connect_toggled(move |btn| {
             if let Some(w) = weak.upgrade() {
-                w.restart_journal();
+                if !btn.is_active() {
+                    let held = w.journal_held.take();
+                    if !held.is_empty() {
+                        w.append_journal(&held);
+                    }
+                }
+                w.update_pause_label();
             }
         });
+        let weak = Rc::downgrade(&w);
+        w.journal_search.connect_search_changed(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.highlight_all();
+                w.find_journal(true, true);
+            }
+        });
+        for (signal_btn, forward) in [(&journal_next, true), (&journal_prev, false)] {
+            let weak = Rc::downgrade(&w);
+            signal_btn.connect_clicked(move |_| {
+                if let Some(w) = weak.upgrade() {
+                    w.find_journal(forward, false);
+                }
+            });
+        }
+        let weak = Rc::downgrade(&w);
+        w.journal_search.connect_activate(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.find_journal(true, false);
+            }
+        });
+        let weak = Rc::downgrade(&w);
+        w.journal_search.connect_next_match(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.find_journal(true, false);
+            }
+        });
+        let weak = Rc::downgrade(&w);
+        w.journal_search.connect_previous_match(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.find_journal(false, false);
+            }
+        });
+        // Shift+Enter goes to the previous match.
+        let keys = gtk::EventControllerKey::new();
+        let weak = Rc::downgrade(&w);
+        keys.connect_key_pressed(move |_, key, _, mods| {
+            let shift_enter = matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+                && mods.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            if shift_enter {
+                if let Some(w) = weak.upgrade() {
+                    w.find_journal(false, false);
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        w.journal_search.add_controller(keys);
         let weak = Rc::downgrade(&w);
         w.journal_lines.connect_selected_notify(move |_| {
             if let Some(w) = weak.upgrade() {
@@ -956,10 +1049,15 @@ impl Window {
 
     // ---- Journal -----------------------------------------------------------
 
+    /// Streams the selected unit's log live (journalctl -f).
     fn restart_journal(self: &Rc<Self>) {
         self.journal.replace(None);
         let generation = self.journal_gen.get() + 1;
         self.journal_gen.set(generation);
+        self.journal_held.borrow_mut().clear();
+        self.journal_pause.set_active(false);
+        self.journal_matches.set(0);
+        self.update_matches_label();
         let buffer = self.journal_view.buffer();
         buffer.set_text("");
         let Some(name) = self.selected.borrow().clone() else {
@@ -969,8 +1067,7 @@ impl Window {
             .get(self.journal_lines.selected() as usize)
             .copied()
             .unwrap_or(500);
-        let follow = self.journal_follow.is_active();
-        match journal::spawn(self.bus.get(), &name, lines, follow) {
+        match journal::spawn(self.bus.get(), &name, lines, true) {
             Err(e) => buffer.set_text(&format!("Could not run journalctl: {e}")),
             Ok((stream, rx)) => {
                 self.journal.replace(Some(stream));
@@ -988,15 +1085,38 @@ impl Window {
                                 Err(_) => break,
                             }
                         }
-                        w.append_journal(&chunk);
+                        if w.journal_pause.is_active() {
+                            w.journal_held.borrow_mut().push_str(&chunk);
+                            w.update_pause_label();
+                        } else {
+                            w.append_journal(&chunk);
+                        }
                     }
                 });
             }
         }
     }
 
+    fn update_pause_label(&self) {
+        let held = self.journal_held.borrow().matches('\n').count();
+        let (label, icon) = match (self.journal_pause.is_active(), held) {
+            (false, _) => ("Pause".to_string(), "media-playback-pause-symbolic"),
+            (true, 0) => ("Resume".to_string(), "media-playback-start-symbolic"),
+            (true, n) => (format!("Resume ({n} new)"), "media-playback-start-symbolic"),
+        };
+        if let Some(content) = self
+            .journal_pause
+            .child()
+            .and_downcast::<adw::ButtonContent>()
+        {
+            content.set_label(&label);
+            content.set_icon_name(icon);
+        }
+    }
+
     fn append_journal(&self, text: &str) {
         let buffer = self.journal_view.buffer();
+        let start_offset = buffer.end_iter().offset();
         buffer.insert(&mut buffer.end_iter(), text);
         let excess = buffer.line_count() - JOURNAL_MAX_LINES;
         if excess > 0 {
@@ -1004,11 +1124,102 @@ impl Window {
                 buffer.delete(&mut buffer.start_iter(), &mut cut);
             }
         }
+        if !self.journal_search.text().is_empty() {
+            // Highlight matches in the new lines only; don't scroll away from
+            // the match the user is looking at.
+            let start = buffer.iter_at_offset(start_offset.min(buffer.end_iter().offset()));
+            let found = self.highlight_range(&start, &buffer.end_iter());
+            self.journal_matches.set(self.journal_matches.get() + found);
+            self.update_matches_label();
+            return;
+        }
         let mark = buffer
             .mark("end")
             .unwrap_or_else(|| buffer.create_mark(Some("end"), &buffer.end_iter(), false));
         buffer.move_mark(&mark, &buffer.end_iter());
         self.journal_view.scroll_mark_onscreen(&mark);
+    }
+
+    // ---- Journal search ----------------------------------------------------
+
+    fn search_flags() -> gtk::TextSearchFlags {
+        gtk::TextSearchFlags::CASE_INSENSITIVE | gtk::TextSearchFlags::TEXT_ONLY
+    }
+
+    /// Tags every match between `start` and `end`; returns how many there were.
+    fn highlight_range(&self, start: &gtk::TextIter, end: &gtk::TextIter) -> usize {
+        let query = self.journal_search.text();
+        if query.is_empty() {
+            return 0;
+        }
+        let buffer = self.journal_view.buffer();
+        let mut from = *start;
+        let mut found = 0;
+        while let Some((m_start, m_end)) =
+            from.forward_search(&query, Self::search_flags(), Some(end))
+        {
+            buffer.apply_tag_by_name("match", &m_start, &m_end);
+            found += 1;
+            from = m_end;
+        }
+        found
+    }
+
+    fn highlight_all(&self) {
+        let buffer = self.journal_view.buffer();
+        let (start, end) = buffer.bounds();
+        buffer.remove_tag_by_name("match", &start, &end);
+        buffer.remove_tag_by_name("current-match", &start, &end);
+        self.journal_matches.set(self.highlight_range(&start, &end));
+        self.update_matches_label();
+    }
+
+    fn update_matches_label(&self) {
+        let label = match (
+            self.journal_search.text().is_empty(),
+            self.journal_matches.get(),
+        ) {
+            (true, _) => String::new(),
+            (false, 0) => "No matches".into(),
+            (false, 1) => "1 match".into(),
+            (false, n) => format!("{n} matches"),
+        };
+        self.journal_matches_label.set_label(&label);
+    }
+
+    /// Selects the next (or previous) match after the current selection, wrapping around.
+    /// With `from_top`, starts from the beginning of the log.
+    fn find_journal(&self, forward: bool, from_top: bool) {
+        let query = self.journal_search.text();
+        if query.is_empty() {
+            return;
+        }
+        let buffer = self.journal_view.buffer();
+        let (sel_start, sel_end) = buffer
+            .selection_bounds()
+            .unwrap_or_else(|| (buffer.start_iter(), buffer.start_iter()));
+        let flags = Self::search_flags();
+        let found = if forward {
+            let from = if from_top {
+                buffer.start_iter()
+            } else {
+                sel_end
+            };
+            from.forward_search(&query, flags, None)
+                .or_else(|| buffer.start_iter().forward_search(&query, flags, None))
+        } else {
+            sel_start
+                .backward_search(&query, flags, None)
+                .or_else(|| buffer.end_iter().backward_search(&query, flags, None))
+        };
+        if let Some((start, end)) = found {
+            let (all_start, all_end) = buffer.bounds();
+            buffer.remove_tag_by_name("current-match", &all_start, &all_end);
+            buffer.apply_tag_by_name("current-match", &start, &end);
+            buffer.select_range(&start, &end);
+            self.journal_view
+                .scroll_to_mark(&buffer.get_insert(), 0.1, false, 0.0, 0.0);
+        }
     }
 
     // ---- Unit file ---------------------------------------------------------
