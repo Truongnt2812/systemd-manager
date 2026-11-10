@@ -158,6 +158,85 @@ impl Action {
     }
 }
 
+/// Text for a dialog that asks before a risky action.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Confirmation {
+    pub heading: String,
+    pub body: String,
+    /// Label of the button that goes ahead.
+    pub verb: &'static str,
+}
+
+/// What stopping a well-known system service breaks, if it is one.
+fn critical_role(name: &str) -> Option<&'static str> {
+    let stem = name.trim_end_matches(".service");
+    Some(match stem {
+        "ssh" | "sshd" => "remote SSH logins, including the session you may be using right now",
+        "NetworkManager" | "systemd-networkd" | "wpa_supplicant" | "iwd" | "connman" => {
+            "your network connection"
+        }
+        "systemd-resolved" => "DNS name resolution",
+        "gdm" | "gdm3" | "sddm" | "lightdm" | "display-manager" => {
+            "the login screen and your desktop session"
+        }
+        "dbus" | "dbus-broker" | "polkit" | "systemd-logind" => {
+            "core parts of the system, including this app"
+        }
+        "systemd-journald" => "system logging",
+        "firewalld" | "ufw" | "nftables" => "the firewall",
+        _ => return None,
+    })
+}
+
+/// Returns the question to ask before running `action`, or None when it is safe to
+/// go ahead. Only system services are guarded: masking any of them, and stopping,
+/// restarting or disabling the ones a working system depends on.
+pub fn confirmation(bus: Bus, name: &str, action: Action, running: bool) -> Option<Confirmation> {
+    if bus != Bus::System {
+        return None;
+    }
+    let role = critical_role(name);
+    let warning = role
+        .map(|r| format!("\n\n{name} provides {r}."))
+        .unwrap_or_default();
+    let (heading, body, verb) = match action {
+        Action::Mask => (
+            format!("Mask {name}?"),
+            format!(
+                "A masked service cannot be started at all, not even as a dependency of another service, until you unmask it.{warning}"
+            ),
+            "Mask",
+        ),
+        Action::Stop if running && role.is_some() => (
+            format!("Stop {name}?"),
+            format!("Stopping it can cut you off from {}.", role?),
+            "Stop",
+        ),
+        Action::Restart if running && role.is_some() => (
+            format!("Restart {name}?"),
+            format!(
+                "While it restarts you can briefly lose {}. If it fails to come back, you lose it until it is started again.",
+                role?
+            ),
+            "Restart",
+        ),
+        Action::Disable if role.is_some() => (
+            format!("Disable {name}?"),
+            format!(
+                "It will no longer start at boot, so after the next restart you will be without {}.",
+                role?
+            ),
+            "Disable",
+        ),
+        _ => return None,
+    };
+    Some(Confirmation {
+        heading,
+        body,
+        verb,
+    })
+}
+
 fn proxy(conn: &Connection, path: impl Into<String>, iface: &'static str) -> Res<Proxy<'static>> {
     let path = zbus::zvariant::ObjectPath::try_from(path.into()).map_err(err)?;
     Builder::<Proxy>::new(conn)
@@ -581,6 +660,25 @@ mod tests {
         assert!(system.contains("User=nobody\n"));
         assert!(system.ends_with("[Install]\nWantedBy=multi-user.target\n"));
         assert!(!render_unit(Bus::User, &spec).contains("User="));
+    }
+
+    #[test]
+    fn risky_actions_need_confirmation() {
+        let ask = |bus, name, action, running| confirmation(bus, name, action, running).is_some();
+        assert!(ask(Bus::System, "sshd.service", Action::Stop, true));
+        assert!(ask(
+            Bus::System,
+            "NetworkManager.service",
+            Action::Disable,
+            false
+        ));
+        assert!(ask(Bus::System, "gdm.service", Action::Restart, true));
+        assert!(ask(Bus::System, "foo.service", Action::Mask, false));
+        // Ordinary services, stopped services, safe actions and user services go ahead.
+        assert!(!ask(Bus::System, "foo.service", Action::Stop, true));
+        assert!(!ask(Bus::System, "sshd.service", Action::Stop, false));
+        assert!(!ask(Bus::System, "sshd.service", Action::Start, false));
+        assert!(!ask(Bus::User, "sshd.service", Action::Mask, true));
     }
 
     #[test]

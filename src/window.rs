@@ -1155,10 +1155,39 @@ impl Window {
         b.unmask.set_visible(masked);
     }
 
+    /// Runs `action` on the selected service, asking first when it is risky.
     fn run(self: &Rc<Self>, action: Action) {
         let Some(name) = self.selected.borrow().clone() else {
             return;
         };
+        let running = self.details.borrow().as_ref().is_some_and(|d| {
+            matches!(
+                d.active_state.as_str(),
+                "active" | "reloading" | "activating"
+            )
+        });
+        let Some(ask) = systemd::confirmation(self.bus.get(), &name, action, running) else {
+            self.run_now(name, action);
+            return;
+        };
+        let dialog = adw::AlertDialog::new(Some(&ask.heading), Some(&ask.body));
+        dialog.add_responses(&[("cancel", "_Cancel"), ("go", ask.verb)]);
+        dialog.set_response_appearance("go", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let weak = Rc::downgrade(self);
+        dialog.choose(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |response| {
+                if let (Some(w), "go") = (weak.upgrade(), response.as_str()) {
+                    w.run_now(name, action);
+                }
+            },
+        );
+    }
+
+    fn run_now(self: &Rc<Self>, name: String, action: Action) {
         let bus = self.bus.get();
         let weak = Rc::downgrade(self);
         background(
