@@ -15,6 +15,19 @@ use crate::systemd::{self, Action, Bus, Details, EditTarget, Res, Service};
 const FILTERS: [&str; 5] = ["All", "Running", "Failed", "Inactive", "Enabled"];
 const JOURNAL_LINES: [u32; 4] = [100, 500, 2000, 10000];
 const JOURNAL_MAX_LINES: i32 = 20000;
+const JOURNAL_PRIORITIES: [(&str, Option<&str>); 3] = [
+    ("All messages", None),
+    ("Warnings and errors", Some("warning")),
+    ("Errors only", Some("err")),
+];
+const JOURNAL_BOOTS: [&str; 2] = ["All boots", "This boot"];
+const JOURNAL_SINCE: [(&str, Option<&str>); 5] = [
+    ("Any time", None),
+    ("Last 15 minutes", Some("-15min")),
+    ("Last hour", Some("-1h")),
+    ("Last 24 hours", Some("-1d")),
+    ("Last 7 days", Some("-7d")),
+];
 
 /// Runs `work` on a worker thread and hands its result to `done` on the main thread.
 pub fn background<T, W, D>(work: W, done: D)
@@ -74,6 +87,10 @@ pub struct Window {
     journal_search: gtk::SearchEntry,
     journal_matches_label: gtk::Label,
     journal_lines: gtk::DropDown,
+    journal_filter_btn: gtk::MenuButton,
+    journal_priority: gtk::DropDown,
+    journal_boot: gtk::DropDown,
+    journal_since: gtk::DropDown,
     unit_view: gtk::TextView,
     unit_banner: adw::Banner,
     unit_path_label: gtk::Label,
@@ -413,6 +430,42 @@ impl Window {
             .icon_name("view-refresh-symbolic")
             .tooltip_text("Reload log")
             .build();
+        let journal_save = gtk::Button::builder()
+            .icon_name("document-save-symbolic")
+            .tooltip_text("Save log to a file")
+            .build();
+
+        let journal_priority = gtk::DropDown::from_strings(
+            &JOURNAL_PRIORITIES.iter().map(|p| p.0).collect::<Vec<_>>(),
+        );
+        let journal_boot = gtk::DropDown::from_strings(&JOURNAL_BOOTS);
+        let journal_since =
+            gtk::DropDown::from_strings(&JOURNAL_SINCE.iter().map(|p| p.0).collect::<Vec<_>>());
+        let filter_grid = gtk::Grid::builder()
+            .row_spacing(6)
+            .column_spacing(12)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        for (row, (title, dropdown)) in [
+            ("Priority", &journal_priority),
+            ("Boot", &journal_boot),
+            ("Time", &journal_since),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let label = gtk::Label::builder().label(title).xalign(0.0).build();
+            filter_grid.attach(&label, 0, row as i32, 1, 1);
+            filter_grid.attach(dropdown, 1, row as i32, 1, 1);
+        }
+        let journal_filter_btn = gtk::MenuButton::builder()
+            .label("Filters")
+            .tooltip_text("Show only some priorities, boots or times")
+            .popover(&gtk::Popover::builder().child(&filter_grid).build())
+            .build();
         let journal_bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
@@ -422,11 +475,13 @@ impl Window {
             .margin_bottom(6)
             .build();
         journal_bar.append(&journal_lines);
+        journal_bar.append(&journal_filter_btn);
         journal_bar.append(&journal_pause);
         journal_bar.append(&journal_search);
         journal_bar.append(&journal_matches_label);
         journal_bar.append(&linked(&[&journal_prev, &journal_next]));
         journal_bar.append(&journal_reload);
+        journal_bar.append(&journal_save);
         let journal_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         journal_box.append(&journal_bar);
         journal_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -585,6 +640,10 @@ impl Window {
             journal_search,
             journal_matches_label,
             journal_lines,
+            journal_filter_btn,
+            journal_priority,
+            journal_boot,
+            journal_since,
             unit_view,
             unit_banner,
             unit_path_label,
@@ -771,10 +830,23 @@ impl Window {
             glib::Propagation::Proceed
         });
         w.journal_search.add_controller(keys);
+        for dropdown in [
+            &w.journal_lines,
+            &w.journal_priority,
+            &w.journal_boot,
+            &w.journal_since,
+        ] {
+            let weak = Rc::downgrade(&w);
+            dropdown.connect_selected_notify(move |_| {
+                if let Some(w) = weak.upgrade() {
+                    w.restart_journal();
+                }
+            });
+        }
         let weak = Rc::downgrade(&w);
-        w.journal_lines.connect_selected_notify(move |_| {
+        journal_save.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.restart_journal();
+                w.save_journal();
             }
         });
         let weak = Rc::downgrade(&w);
@@ -1319,7 +1391,13 @@ impl Window {
             .get(self.journal_lines.selected() as usize)
             .copied()
             .unwrap_or(500);
-        match journal::spawn(self.bus.get(), &name, lines, true) {
+        let filter = self.journal_filter();
+        self.journal_filter_btn
+            .set_label(&match filter.active_count() {
+                0 => "Filters".to_string(),
+                n => format!("Filters ({n})"),
+            });
+        match journal::spawn(self.bus.get(), &name, lines, true, filter) {
             Err(e) => buffer.set_text(&format!("Could not run journalctl: {e}")),
             Ok((stream, rx)) => {
                 self.journal.replace(Some(stream));
@@ -1347,6 +1425,46 @@ impl Window {
                 });
             }
         }
+    }
+
+    fn journal_filter(&self) -> journal::Filter {
+        journal::Filter {
+            priority: JOURNAL_PRIORITIES
+                .get(self.journal_priority.selected() as usize)
+                .and_then(|p| p.1),
+            this_boot: self.journal_boot.selected() == 1,
+            since: JOURNAL_SINCE
+                .get(self.journal_since.selected() as usize)
+                .and_then(|p| p.1),
+        }
+    }
+
+    /// Asks for a file name and writes the log shown (plus lines held while paused).
+    fn save_journal(self: &Rc<Self>) {
+        let Some(name) = self.selected.borrow().clone() else {
+            return;
+        };
+        let buffer = self.journal_view.buffer();
+        let mut text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string();
+        text.push_str(&self.journal_held.borrow());
+        let dialog = gtk::FileDialog::builder()
+            .title("Save Log")
+            .initial_name(format!("{}.log", name.trim_end_matches(".service")))
+            .build();
+        let weak = Rc::downgrade(self);
+        dialog.save(Some(&self.window), None::<&gio::Cancellable>, move |res| {
+            let Some(w) = weak.upgrade() else { return };
+            // An error here usually means the dialog was dismissed.
+            let Some(path) = res.ok().and_then(|f| f.path()) else {
+                return;
+            };
+            match std::fs::write(&path, text) {
+                Ok(()) => w.toast(&format!("Saved log to {}", path.display())),
+                Err(e) => w.toast(&format!("Could not save {}: {e}", path.display())),
+            }
+        });
     }
 
     fn update_pause_label(&self) {
