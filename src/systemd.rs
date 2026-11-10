@@ -144,6 +144,86 @@ pub struct Details {
     pub memory: Option<u64>,
     /// Microseconds since the epoch at which the unit last entered the active state.
     pub active_since: u64,
+    /// CPU time used, in nanoseconds (None without CPU accounting).
+    pub cpu_nsec: Option<u64>,
+    /// Number of tasks (processes and threads) in the unit's cgroup.
+    pub tasks: Option<u64>,
+    /// How many times systemd restarted the service automatically.
+    pub n_restarts: u32,
+    /// How the service last ended: "success", "exit-code", "signal", "timeout", ...
+    pub result: String,
+    /// How the main process last exited (CLD_EXITED = 1, CLD_KILLED = 2, CLD_DUMPED = 3),
+    /// and its exit status or signal number.
+    pub exec_main_code: i32,
+    pub exec_main_status: i32,
+}
+
+/// A plain description of a service's Result property.
+pub fn describe_result(result: &str) -> String {
+    match result {
+        "" => "—",
+        "success" => "Success",
+        "exit-code" => "Failed: the program exited with an error",
+        "signal" => "Failed: the program was killed by a signal",
+        "core-dump" => "Failed: the program crashed (core dumped)",
+        "timeout" => "Failed: timed out",
+        "watchdog" => "Failed: watchdog timeout",
+        "start-limit-hit" => "Failed: restarted too often (start limit hit)",
+        "oom-kill" => "Failed: killed for running out of memory",
+        "resources" => "Failed: could not set up the service (missing file, user or directory?)",
+        "protocol" => "Failed: the program didn't follow the startup protocol of its Type",
+        "exec-condition" => "Skipped: ExecCondition failed",
+        other => return format!("Failed: {other}"),
+    }
+    .to_string()
+}
+
+fn signal_name(n: i32) -> Option<&'static str> {
+    Some(match n {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        _ => return None,
+    })
+}
+
+/// How the main process last exited, e.g. "exit code 1" or "killed by SIGKILL".
+pub fn describe_exit(code: i32, status: i32) -> Option<String> {
+    let signal = || {
+        signal_name(status)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("signal {status}"))
+    };
+    match code {
+        1 => Some(format!("exit code {status}")),
+        2 => Some(format!("killed by {}", signal())),
+        3 => Some(format!("crashed with {} (core dumped)", signal())),
+        _ => None,
+    }
+}
+
+/// CPU time in a readable form: "0.25 s", "3 min 4 s", "2 h 5 min".
+pub fn format_cpu(nsec: u64) -> String {
+    let secs = nsec as f64 / 1e9;
+    if secs < 60.0 {
+        return format!("{secs:.2} s");
+    }
+    let total = secs as u64;
+    let (h, m, s) = (total / 3600, total / 60 % 60, total % 60);
+    if h > 0 {
+        format!("{h} h {m} min")
+    } else {
+        format!("{m} min {s} s")
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -156,6 +236,7 @@ pub enum Action {
     Disable,
     Mask,
     Unmask,
+    ResetFailed,
 }
 
 impl Action {
@@ -169,6 +250,7 @@ impl Action {
             Action::Disable => "Disabled",
             Action::Mask => "Masked",
             Action::Unmask => "Unmasked",
+            Action::ResetFailed => "Reset the failed state of",
         }
     }
 }
@@ -348,10 +430,9 @@ pub fn details(bus: Bus, name: &str) -> Res<Details> {
     let svc = proxy(&conn, path.as_str(), "org.freedesktop.systemd1.Service")?;
 
     let s = |p: &str| unit.get_property::<String>(p).unwrap_or_default();
-    let memory = svc
-        .get_property::<u64>("MemoryCurrent")
-        .ok()
-        .filter(|m| *m != u64::MAX);
+    // u64::MAX means "not known" (accounting off or the unit isn't running).
+    let known = |p: &str| svc.get_property::<u64>(p).ok().filter(|v| *v != u64::MAX);
+    let memory = known("MemoryCurrent");
     Ok(Details {
         description: s("Description"),
         load_state: s("LoadState"),
@@ -367,6 +448,12 @@ pub fn details(bus: Bus, name: &str) -> Res<Details> {
         active_since: unit
             .get_property::<u64>("ActiveEnterTimestamp")
             .unwrap_or(0),
+        cpu_nsec: known("CPUUsageNSec"),
+        tasks: known("TasksCurrent"),
+        n_restarts: svc.get_property::<u32>("NRestarts").unwrap_or(0),
+        result: svc.get_property::<String>("Result").unwrap_or_default(),
+        exec_main_code: svc.get_property::<i32>("ExecMainCode").unwrap_or(0),
+        exec_main_status: svc.get_property::<i32>("ExecMainStatus").unwrap_or(0),
     })
 }
 
@@ -407,6 +494,9 @@ pub fn run_action(bus: Bus, name: &str, action: Action) -> Res<String> {
         Action::Unmask => {
             let _: Vec<(String, String, String)> =
                 call_auth(&m, "UnmaskUnitFiles", &(&names, false))?;
+        }
+        Action::ResetFailed => {
+            let _: () = call_auth(&m, "ResetFailedUnit", &(name,))?;
         }
     }
     if matches!(
@@ -772,6 +862,22 @@ mod tests {
         assert!(!ask(Bus::System, "sshd.service", Action::Stop, false));
         assert!(!ask(Bus::System, "sshd.service", Action::Start, false));
         assert!(!ask(Bus::User, "sshd.service", Action::Mask, true));
+    }
+
+    #[test]
+    fn describes_exits_and_cpu() {
+        assert_eq!(describe_exit(1, 3).as_deref(), Some("exit code 3"));
+        assert_eq!(describe_exit(2, 9).as_deref(), Some("killed by SIGKILL"));
+        assert_eq!(
+            describe_exit(3, 11).as_deref(),
+            Some("crashed with SIGSEGV (core dumped)")
+        );
+        assert_eq!(describe_exit(0, 0), None);
+        assert_eq!(format_cpu(250_000_000), "0.25 s");
+        assert_eq!(format_cpu(184_000_000_000), "3 min 4 s");
+        assert_eq!(format_cpu(7_500_000_000_000), "2 h 5 min");
+        assert_eq!(describe_result("success"), "Success");
+        assert!(describe_result("weird").contains("weird"));
     }
 
     #[test]

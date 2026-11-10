@@ -52,6 +52,11 @@ struct StatusRows {
     memory: adw::ActionRow,
     since: adw::ActionRow,
     path: adw::ActionRow,
+    result: adw::ActionRow,
+    last_exit: adw::ActionRow,
+    cpu: adw::ActionRow,
+    tasks: adw::ActionRow,
+    restarts: adw::ActionRow,
 }
 
 struct ActionButtons {
@@ -63,6 +68,7 @@ struct ActionButtons {
     disable: gtk::Button,
     mask: gtk::Button,
     unmask: gtk::Button,
+    reset_failed: gtk::Button,
     delete: gtk::Button,
 }
 
@@ -303,8 +309,12 @@ impl Window {
             disable: icon_button("Disable", "window-close-symbolic"),
             mask: icon_button("Mask", "action-unavailable-symbolic"),
             unmask: icon_button("Unmask", "edit-undo-symbolic"),
+            reset_failed: icon_button("Reset Failed", "edit-clear-symbolic"),
             delete: icon_button("Delete", "user-trash-symbolic"),
         };
+        buttons.reset_failed.set_tooltip_text(Some(
+            "Clear the failed state and the restart counter, so the service can be started again",
+        ));
         buttons.delete.add_css_class("destructive-action");
         buttons.delete.set_visible(false);
         buttons.delete.set_tooltip_text(Some(
@@ -333,6 +343,7 @@ impl Window {
         boot_box.append(&linked(&[&buttons.enable, &buttons.disable]));
         boot_box.append(&buttons.mask);
         boot_box.append(&buttons.unmask);
+        boot_box.append(&buttons.reset_failed);
         boot_box.append(&buttons.delete);
         run_box.set_halign(gtk::Align::Start);
         boot_box.set_halign(gtk::Align::Start);
@@ -353,15 +364,25 @@ impl Window {
             memory: property_row("Memory"),
             since: property_row("Active since"),
             path: property_row("Unit file"),
+            result: property_row("Last result"),
+            last_exit: property_row("Main process exit"),
+            cpu: property_row("CPU time"),
+            tasks: property_row("Tasks"),
+            restarts: property_row("Automatic restarts"),
         };
         let status_group = adw::PreferencesGroup::new();
         for r in [
             &rows.active,
             &rows.file_state,
+            &rows.result,
+            &rows.last_exit,
             &rows.loaded,
             &rows.since,
             &rows.pid,
             &rows.memory,
+            &rows.cpu,
+            &rows.tasks,
+            &rows.restarts,
             &rows.path,
         ] {
             status_group.add(r);
@@ -754,6 +775,7 @@ impl Window {
             (&b.disable, Action::Disable),
             (&b.mask, Action::Mask),
             (&b.unmask, Action::Unmask),
+            (&b.reset_failed, Action::ResetFailed),
         ] {
             let weak = Rc::downgrade(&w);
             btn.connect_clicked(move |_| {
@@ -1212,6 +1234,28 @@ impl Window {
             .since
             .set_subtitle(&since.unwrap_or_else(|| "—".into()));
         self.rows.path.set_subtitle(&dash(&d.fragment_path));
+        self.rows
+            .result
+            .set_subtitle(&systemd::describe_result(&d.result));
+        for class in ["success", "error"] {
+            self.rows.result.remove_css_class(class);
+        }
+        let failed_result = !d.result.is_empty() && d.result != "success";
+        if failed_result {
+            self.rows.result.add_css_class("error");
+        }
+        let exit = systemd::describe_exit(d.exec_main_code, d.exec_main_status);
+        self.rows.last_exit.set_visible(exit.is_some());
+        self.rows.last_exit.set_subtitle(&exit.unwrap_or_default());
+        self.rows.cpu.set_subtitle(
+            &d.cpu_nsec
+                .map(systemd::format_cpu)
+                .unwrap_or_else(|| "—".into()),
+        );
+        self.rows
+            .tasks
+            .set_subtitle(&d.tasks.map(|t| t.to_string()).unwrap_or_else(|| "—".into()));
+        self.rows.restarts.set_subtitle(&d.n_restarts.to_string());
 
         let b = &self.buttons;
         let running = matches!(d.active_state.as_str(), "active" | "reloading");
@@ -1233,6 +1277,8 @@ impl Window {
         b.disable.set_sensitive(enabled || d.file_state == "linked");
         b.mask.set_visible(!masked);
         b.unmask.set_visible(masked);
+        b.reset_failed
+            .set_visible(d.active_state == "failed" || failed_result || d.n_restarts > 0);
         b.delete.set_visible(systemd::is_deletable(
             self.bus.get(),
             &name,
