@@ -62,6 +62,15 @@ To remove it, run `bash uninstall.sh`. It finds every installed copy (in `~/.loc
 
 The script installs missing build dependencies with your package manager (apt, dnf, pacman or zypper), updates Rust through rustup if it is too old, builds a release binary, and installs it with a desktop entry, icon and AppStream metainfo, so Systemd Manager shows up in your app menu and software centers can describe it. If the file isn't executable after unpacking, run it as `bash install.sh`.
 
+### Packages
+
+```sh
+cargo install cargo-deb && cargo deb                                          # target/debian/*.deb
+cargo build --release && cargo install cargo-generate-rpm && cargo generate-rpm   # target/generate-rpm/*.rpm
+```
+
+GitHub Actions runs `cargo fmt --check`, clippy, the tests and the AppStream check on every push and pull request. Pushing a tag like `v0.2.0` builds the `.deb` (on Ubuntu 24.04) and the `.rpm` (on Fedora) and attaches them to a GitHub release.
+
 ## Build and run without installing
 
 ```sh

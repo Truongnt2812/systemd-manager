@@ -28,3 +28,20 @@ assets = [
   ["data/icons/256x256.png", "usr/share/icons/hicolor/256x256/apps/io.github.systemd_manager.SystemdManager.png", "644"],
   ["README.md", "usr/share/doc/systemd-manager/", "644"],
 ]
+
+# For `cargo generate-rpm` (see .github/workflows/release.yml). Build first with
+# `cargo build --release`.
+[package.metadata.generate-rpm]
+summary = "GTK4 app for managing systemd services"
+assets = [
+  { source = "target/release/systemd-manager", dest = "/usr/bin/systemd-manager", mode = "755" },
+  { source = "data/io.github.systemd_manager.SystemdManager.desktop", dest = "/usr/share/applications/io.github.systemd_manager.SystemdManager.desktop", mode = "644" },
+  { source = "data/io.github.systemd_manager.SystemdManager.metainfo.xml", dest = "/usr/share/metainfo/io.github.systemd_manager.SystemdManager.metainfo.xml", mode = "644" },
+  { source = "data/io.github.systemd_manager.SystemdManager.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.systemd_manager.SystemdManager.svg", mode = "644" },
+  { source = "data/icons/48x48.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.systemd_manager.SystemdManager.png", mode = "644" },
+  { source = "data/icons/256x256.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.systemd_manager.SystemdManager.png", mode = "644" },
+  { source = "README.md", dest = "/usr/share/doc/systemd-manager/README.md", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+polkit = "*"
