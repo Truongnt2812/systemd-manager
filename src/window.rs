@@ -54,6 +54,8 @@ struct ActionButtons {
 
 pub struct Window {
     pub window: adw::ApplicationWindow,
+    system_btn: gtk::ToggleButton,
+    user_btn: gtk::ToggleButton,
     toasts: adw::ToastOverlay,
     split: adw::NavigationSplitView,
     list: gtk::ListBox,
@@ -88,6 +90,8 @@ pub struct Window {
     list_gen: Cell<u64>,
     rebuilding: Cell<bool>,
     unit_loading: Cell<bool>,
+    /// The unit file editor has edits that haven't been saved.
+    unit_dirty: Cell<bool>,
     pending_select: RefCell<Option<String>>,
     refresh_pending: Cell<bool>,
 }
@@ -526,6 +530,8 @@ impl Window {
 
         let w = Rc::new(Window {
             window,
+            system_btn: system_btn.clone(),
+            user_btn,
             toasts,
             split,
             list,
@@ -558,6 +564,7 @@ impl Window {
             list_gen: Cell::new(0),
             rebuilding: Cell::new(false),
             unit_loading: Cell::new(false),
+            unit_dirty: Cell::new(false),
             pending_select: RefCell::new(None),
             refresh_pending: Cell::new(false),
         });
@@ -565,13 +572,23 @@ impl Window {
         // ---- Signals -------------------------------------------------------
         let weak = Rc::downgrade(&w);
         system_btn.connect_toggled(move |btn| {
-            if let Some(w) = weak.upgrade() {
-                w.set_bus(if btn.is_active() {
-                    Bus::System
-                } else {
-                    Bus::User
-                });
+            let Some(w) = weak.upgrade() else { return };
+            let bus = if btn.is_active() {
+                Bus::System
+            } else {
+                Bus::User
+            };
+            if w.bus.get() == bus {
+                return;
             }
+            w.confirm_discard(
+                move |w| w.set_bus(bus),
+                // Put the toggle back on the bus we are still showing.
+                |w| match w.bus.get() {
+                    Bus::System => w.system_btn.set_active(true),
+                    Bus::User => w.user_btn.set_active(true),
+                },
+            );
         });
         let weak = Rc::downgrade(&w);
         refresh_btn.connect_clicked(move |_| {
@@ -615,9 +632,11 @@ impl Window {
                 .borrow()
                 .get(row.index() as usize)
                 .map(|s| s.name.clone());
-            if let Some(name) = name {
-                w.select(name);
+            let Some(name) = name else { return };
+            if w.selected.borrow().as_deref() == Some(name.as_str()) {
+                return;
             }
+            w.confirm_discard(move |w| w.select(name), |w| w.reselect_current());
         });
         let weak = Rc::downgrade(&w);
         w.list.connect_row_activated(move |_, _| {
@@ -723,6 +742,7 @@ impl Window {
             if let Some(w) = weak.upgrade() {
                 if !w.unit_loading.get() {
                     w.unit_save.set_sensitive(true);
+                    w.unit_dirty.set(true);
                 }
             }
         });
@@ -736,6 +756,16 @@ impl Window {
         // The window owns the only strong reference to our state.
         let strong = w.clone();
         w.window.connect_close_request(move |_| {
+            if strong.unit_dirty.get() {
+                strong.confirm_discard(
+                    |w| {
+                        w.unit_dirty.set(false);
+                        w.window.close();
+                    },
+                    |_| {},
+                );
+                return glib::Propagation::Stop;
+            }
             strong.journal.replace(None);
             glib::Propagation::Proceed
         });
@@ -862,9 +892,65 @@ impl Window {
         self.rebuilding.set(false);
         self.update_count();
         if let Some(name) = pending {
-            self.select(name);
-            self.split.set_show_content(true);
+            self.confirm_discard(
+                move |w| {
+                    w.select(name);
+                    w.split.set_show_content(true);
+                },
+                |w| w.reselect_current(),
+            );
         }
+    }
+
+    /// Highlights the selected service's row again, e.g. after the user cancels
+    /// switching to another service.
+    fn reselect_current(&self) {
+        let name = self.selected.borrow().clone();
+        let idx = name.and_then(|n| self.services.borrow().iter().position(|s| s.name == n));
+        self.rebuilding.set(true);
+        match idx.and_then(|i| self.list.row_at_index(i as i32)) {
+            Some(row) => self.list.select_row(Some(&row)),
+            None => self.list.unselect_all(),
+        }
+        self.rebuilding.set(false);
+    }
+
+    /// Runs `proceed` right away when the unit file editor has no unsaved edits.
+    /// Otherwise asks first, then runs `proceed` on Discard or `cancel` on Cancel.
+    fn confirm_discard(
+        self: &Rc<Self>,
+        proceed: impl FnOnce(&Rc<Self>) + 'static,
+        cancel: impl FnOnce(&Rc<Self>) + 'static,
+    ) {
+        if !self.unit_dirty.get() {
+            proceed(self);
+            return;
+        }
+        let name = self.selected.borrow().clone().unwrap_or_default();
+        let dialog = adw::AlertDialog::new(
+            Some("Discard Unsaved Changes?"),
+            Some(&format!(
+                "Your edits to the unit file of {name} have not been saved."
+            )),
+        );
+        dialog.add_responses(&[("cancel", "_Cancel"), ("discard", "_Discard")]);
+        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let weak = Rc::downgrade(self);
+        dialog.choose(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |response| {
+                let Some(w) = weak.upgrade() else { return };
+                if response == "discard" {
+                    w.unit_dirty.set(false);
+                    proceed(&w);
+                } else {
+                    cancel(&w);
+                }
+            },
+        );
     }
 
     fn row_visible(&self, index: i32) -> bool {
@@ -1245,6 +1331,7 @@ impl Window {
             }
         }
         self.unit_loading.set(false);
+        self.unit_dirty.set(false);
         self.unit_view.set_editable(editable);
         self.unit_save.set_sensitive(false);
         self.unit_path_label
