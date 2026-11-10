@@ -4,7 +4,6 @@
 #   ./install.sh                 install for all users into /usr/local (asks for sudo)
 #   ./install.sh --user          install only for you into ~/.local (no sudo)
 #   ./install.sh --prefix DIR    install into DIR
-#   ./install.sh --uninstall     remove an installation (combine with --user/--prefix)
 #   ./install.sh --no-deps       don't try to install missing build dependencies
 set -euo pipefail
 
@@ -17,16 +16,14 @@ MIN_ADW="1.5"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="/usr/local"
 USER_INSTALL=0
-UNINSTALL=0
 INSTALL_DEPS=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --user) USER_INSTALL=1; PREFIX="$HOME/.local" ;;
         --prefix) PREFIX="${2:?--prefix needs a directory}"; shift ;;
-        --uninstall) UNINSTALL=1 ;;
         --no-deps) INSTALL_DEPS=0 ;;
-        -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
     shift
@@ -64,15 +61,6 @@ refresh_caches() {
         $SUDO gtk-update-icon-cache -q -t -f "$ICON_DIR" || true
     fi
 }
-
-if [[ $UNINSTALL -eq 1 ]]; then
-    say "Removing Systemd Manager from $PREFIX"
-    $SUDO rm -f "$BIN_PATH" "$DESKTOP_PATH" "$ICON_PATH" \
-        "$ICON_DIR/48x48/apps/$APP_ID.png" "$ICON_DIR/256x256/apps/$APP_ID.png"
-    refresh_caches
-    say "Uninstalled."
-    exit 0
-fi
 
 # ---- Build dependencies -----------------------------------------------------
 
