@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use zbus::blocking::{proxy::Builder, Connection, Proxy};
 use zbus::proxy::{CacheProperties, MethodFlags};
@@ -32,14 +32,19 @@ pub enum Bus {
 }
 
 impl Bus {
-    fn connection(self) -> Res<Connection> {
-        static SYSTEM: OnceLock<Connection> = OnceLock::new();
-        static USER: OnceLock<Connection> = OnceLock::new();
-        let cell = match self {
+    fn cached(self) -> &'static Mutex<Option<Connection>> {
+        static SYSTEM: Mutex<Option<Connection>> = Mutex::new(None);
+        static USER: Mutex<Option<Connection>> = Mutex::new(None);
+        match self {
             Bus::System => &SYSTEM,
             Bus::User => &USER,
-        };
-        if let Some(c) = cell.get() {
+        }
+    }
+
+    /// The shared connection to this bus, opened on first use.
+    fn connection(self) -> Res<Connection> {
+        let mut cell = self.cached().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cell.as_ref() {
             return Ok(c.clone());
         }
         let c = match self {
@@ -47,7 +52,17 @@ impl Bus {
             Bus::User => Connection::session(),
         }
         .map_err(err)?;
-        Ok(cell.get_or_init(|| c).clone())
+        *cell = Some(c.clone());
+        Ok(c)
+    }
+
+    /// Forgets the shared connection, so the next call opens a new one. Used after
+    /// the bus went away (e.g. dbus or systemd was restarted).
+    pub fn reset_connection(self) {
+        self.cached()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 
     /// Directory where locally administered unit files live.
@@ -403,9 +418,11 @@ pub fn run_action(bus: Bus, name: &str, action: Action) -> Res<String> {
     Ok(format!("{} {name}{note}", action.past_tense()))
 }
 
-/// Blocks forever, calling `on_change` whenever a unit starts, stops or fails,
-/// a job finishes, unit files change, or systemd reloads.
-pub fn watch(bus: Bus, on_change: impl Fn()) -> Res<()> {
+/// Blocks until the connection is lost, calling `on_change` whenever a unit starts,
+/// stops or fails, a job finishes, unit files change, or systemd reloads.
+/// With `changed_now`, also calls it once right after subscribing, to catch up on
+/// changes missed while we weren't watching.
+pub fn watch(bus: Bus, changed_now: bool, on_change: impl Fn()) -> Res<()> {
     let conn = bus.connection()?;
     let rule = MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
@@ -416,8 +433,13 @@ pub fn watch(bus: Bus, on_change: impl Fn()) -> Res<()> {
         zbus::blocking::MessageIterator::for_match_rule(rule, &conn, Some(256)).map_err(err)?;
     // systemd only emits most signals once a client has subscribed.
     let _: () = manager(bus)?.call("Subscribe", &()).map_err(err)?;
+    if changed_now {
+        on_change();
+    }
 
-    for msg in signals.flatten() {
+    for msg in signals {
+        // A broken connection shows up as an error; reconnecting is up to the caller.
+        let Ok(msg) = msg else { break };
         let header = msg.header();
         let relevant = match header.member().map(|m| m.as_str()) {
             Some("JobRemoved" | "UnitFilesChanged" | "Reloading") => true,
@@ -435,6 +457,31 @@ pub fn watch(bus: Bus, on_change: impl Fn()) -> Res<()> {
         }
     }
     Err("lost connection to systemd".into())
+}
+
+/// Watches `bus` forever: like [`watch`], but reconnects when the connection drops,
+/// waiting 1 s, then 2 s, ... up to 30 s between attempts.
+pub fn watch_forever(bus: Bus, on_change: impl Fn()) {
+    let mut delay = std::time::Duration::from_secs(1);
+    let mut attempt = 0u32;
+    let mut last_error = String::new();
+    loop {
+        let started = std::time::Instant::now();
+        let res = watch(bus, attempt > 0, &on_change);
+        attempt += 1;
+        let e = res.err().unwrap_or_default();
+        if e != last_error {
+            eprintln!("watching {bus:?} services: {e}; reconnecting");
+            last_error = e;
+        }
+        bus.reset_connection();
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            // We were connected for a while: start the back-off over.
+            delay = std::time::Duration::from_secs(1);
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(std::time::Duration::from_secs(30));
+    }
 }
 
 /// Where edits to a unit are saved.

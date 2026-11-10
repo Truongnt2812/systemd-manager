@@ -879,11 +879,9 @@ impl Window {
         for bus in [Bus::System, Bus::User] {
             let (tx, rx) = async_channel::bounded::<()>(1);
             std::thread::spawn(move || {
-                if let Err(e) = systemd::watch(bus, || {
+                systemd::watch_forever(bus, || {
                     let _ = tx.try_send(());
-                }) {
-                    eprintln!("not watching {bus:?} services for changes: {e}");
-                }
+                });
             });
             let weak = Rc::downgrade(self);
             glib::spawn_future_local(async move {
