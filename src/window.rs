@@ -13,6 +13,44 @@ use crate::new_service;
 use crate::systemd::{self, Action, Bus, Details, EditTarget, Res, Service};
 use crate::timers;
 
+const SHORTCUTS_UI: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <object class="GtkShortcutsWindow" id="help_overlay">
+    <property name="modal">True</property>
+    <child>
+      <object class="GtkShortcutsSection">
+        <property name="section-name">shortcuts</property>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">General</property>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Search services, or the log on the Journal tab</property><property name="accelerator">&lt;Ctrl&gt;f</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">New service</property><property name="accelerator">&lt;Ctrl&gt;n</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Timers</property><property name="accelerator">&lt;Ctrl&gt;t</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Refresh</property><property name="accelerator">F5</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">System services</property><property name="accelerator">&lt;Ctrl&gt;1</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">User services</property><property name="accelerator">&lt;Ctrl&gt;2</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Keyboard shortcuts</property><property name="accelerator">&lt;Ctrl&gt;question</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Close window</property><property name="accelerator">&lt;Ctrl&gt;w</property></object></child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Selected Service</property>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Start</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;s</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Stop</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;x</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Restart</property><property name="accelerator">&lt;Ctrl&gt;r</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Save unit file and reload</property><property name="accelerator">&lt;Ctrl&gt;s</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Pause or resume the journal</property><property name="accelerator">&lt;Ctrl&gt;p</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Status, Journal and Unit File tabs</property><property name="accelerator">&lt;Alt&gt;1 &lt;Alt&gt;2 &lt;Alt&gt;3</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Next / previous match in the log</property><property name="accelerator">Return &lt;Shift&gt;Return</property></object></child>
+          </object>
+        </child>
+      </object>
+    </child>
+  </object>
+</interface>
+"#;
+
 const FILTERS: [&str; 5] = ["All", "Running", "Failed", "Inactive", "Enabled"];
 const JOURNAL_LINES: [u32; 4] = [100, 500, 2000, 10000];
 const JOURNAL_MAX_LINES: i32 = 20000;
@@ -90,6 +128,7 @@ pub struct Window {
     count_label: gtk::Label,
     content_page: adw::NavigationPage,
     content_stack: gtk::Stack,
+    view_stack: adw::ViewStack,
     name_label: gtk::Label,
     description_label: gtk::Label,
     rows: StatusRows,
@@ -341,6 +380,16 @@ impl Window {
         side_header.set_title_widget(Some(&bus_box));
         side_header.pack_start(&refresh_btn);
         side_header.pack_start(&timers_btn);
+        let main_menu = gio::Menu::new();
+        main_menu.append(Some("_Keyboard Shortcuts"), Some("win.show-help-overlay"));
+        main_menu.append(Some("_About Systemd Manager"), Some("win.about"));
+        let menu_btn = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .tooltip_text("Main menu")
+            .menu_model(&main_menu)
+            .primary(true)
+            .build();
+        side_header.pack_end(&menu_btn);
         side_header.pack_end(&new_btn);
 
         let search = gtk::SearchEntry::builder()
@@ -763,6 +812,7 @@ impl Window {
             count_label,
             content_page,
             content_stack,
+            view_stack,
             name_label,
             description_label,
             rows,
@@ -1044,9 +1094,108 @@ impl Window {
             glib::Propagation::Proceed
         });
 
+        w.add_shortcuts(app);
         w.refresh_list();
         w.watch_systemd();
         w
+    }
+
+    /// Window actions with keyboard shortcuts, and the shortcuts window (Ctrl+?).
+    fn add_shortcuts(self: &Rc<Self>, app: &adw::Application) {
+        type Handler = fn(&Rc<Window>);
+        let actions: [(&str, &[&str], Handler); 16] = [
+            ("new-service", &["<Ctrl>n"], |w| new_service::show(w)),
+            ("timers", &["<Ctrl>t"], |w| timers::show(w)),
+            ("find", &["<Ctrl>f"], |w| w.focus_search()),
+            ("refresh", &["F5"], |w| {
+                w.refresh_list();
+                w.load_details(false);
+            }),
+            ("save", &["<Ctrl>s"], |w| {
+                if w.unit_save.is_sensitive() {
+                    w.save_unit();
+                }
+            }),
+            ("start", &["<Ctrl><Shift>s"], |w| {
+                w.press(&w.buttons.start, Action::Start)
+            }),
+            ("stop", &["<Ctrl><Shift>x"], |w| {
+                w.press(&w.buttons.stop, Action::Stop)
+            }),
+            ("restart", &["<Ctrl>r"], |w| {
+                w.press(&w.buttons.restart, Action::Restart)
+            }),
+            ("pause-journal", &["<Ctrl>p"], |w| {
+                w.journal_pause.set_active(!w.journal_pause.is_active())
+            }),
+            ("tab-status", &["<Alt>1"], |w| w.show_tab("status")),
+            ("tab-journal", &["<Alt>2"], |w| w.show_tab("journal")),
+            ("tab-unit", &["<Alt>3"], |w| w.show_tab("unit")),
+            ("system-bus", &["<Ctrl>1"], |w| {
+                w.system_btn.set_active(true)
+            }),
+            ("user-bus", &["<Ctrl>2"], |w| w.user_btn.set_active(true)),
+            ("close", &["<Ctrl>w"], |w| w.window.close()),
+            ("about", &[], |w| w.show_about()),
+        ];
+        for (name, accels, handler) in actions {
+            let action = gio::SimpleAction::new(name, None);
+            let weak = Rc::downgrade(self);
+            action.connect_activate(move |_, _| {
+                if let Some(w) = weak.upgrade() {
+                    handler(&w);
+                }
+            });
+            self.window.add_action(&action);
+            if !accels.is_empty() {
+                app.set_accels_for_action(&format!("win.{name}"), accels);
+            }
+        }
+        app.set_accels_for_action("win.show-help-overlay", &["<Ctrl>question"]);
+        let builder = gtk::Builder::from_string(SHORTCUTS_UI);
+        if let Some(overlay) = builder.object::<gtk::ShortcutsWindow>("help_overlay") {
+            self.window.set_help_overlay(Some(&overlay));
+        }
+    }
+
+    /// Runs an action from a shortcut, only when its button is available.
+    fn press(self: &Rc<Self>, button: &gtk::Button, action: Action) {
+        let shown = self.content_stack.visible_child_name().as_deref() == Some("details");
+        if shown && button.is_visible() && button.is_sensitive() {
+            self.run(action);
+        }
+    }
+
+    /// Ctrl+F: the log search on the Journal tab, otherwise the service search.
+    fn focus_search(&self) {
+        let details = self.content_stack.visible_child_name().as_deref() == Some("details");
+        if details && self.view_stack.visible_child_name().as_deref() == Some("journal") {
+            self.journal_search.grab_focus();
+        } else {
+            self.split.set_show_content(false);
+            self.search.grab_focus();
+        }
+    }
+
+    fn show_tab(&self, name: &str) {
+        if self.content_stack.visible_child_name().as_deref() == Some("details") {
+            self.view_stack.set_visible_child_name(name);
+            self.split.set_show_content(true);
+        }
+    }
+
+    fn show_about(&self) {
+        let about = adw::AboutDialog::builder()
+            .application_name("Systemd Manager")
+            .application_icon(crate::APP_ID)
+            .version(env!("CARGO_PKG_VERSION"))
+            .comments(env!("CARGO_PKG_DESCRIPTION"))
+            .developer_name("Truong Nguyen")
+            .license_type(gtk::License::MitX11)
+            .website("https://github.com/Truongnt2812/systemd-manager")
+            .issue_url("https://github.com/Truongnt2812/systemd-manager/issues")
+            .build();
+        about.present(Some(&self.window));
     }
 
     pub fn bus(&self) -> Bus {

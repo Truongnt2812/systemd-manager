@@ -17,6 +17,21 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 - **Timers** (the alarm button) lists the timers with the unit each one starts and its next and last run. Click one to jump to its service. A service's Status tab shows which timer starts it.
 - **Delete** removes a service you created (one whose unit file is in `/etc/systemd/system/` or `~/.config/systemd/user/`): it stops and disables it, deletes the unit file and its drop-ins, and reloads systemd. Vendor units can't be deleted.
 
+### Keyboard shortcuts
+
+| Keys | Action |
+| --- | --- |
+| Ctrl+F | Search services (or the log, on the Journal tab) |
+| Ctrl+N | New service |
+| Ctrl+T | Timers |
+| F5 | Refresh |
+| Ctrl+1 / Ctrl+2 | System / User services |
+| Ctrl+Shift+S, Ctrl+Shift+X, Ctrl+R | Start, Stop, Restart the selected service |
+| Ctrl+S | Save the unit file and reload |
+| Ctrl+P | Pause or resume the journal |
+| Alt+1 / Alt+2 / Alt+3 | Status / Journal / Unit File tab |
+| Ctrl+? | Show all shortcuts |
+
 ## Requirements
 
 - GTK 4.14 or newer and libadwaita 1.5 or newer (Ubuntu 24.04+, Debian 13, Fedora 40+, Arch, openSUSE Tumbleweed)

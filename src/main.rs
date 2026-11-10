@@ -7,7 +7,7 @@ mod window;
 use adw::prelude::*;
 use gtk::glib;
 
-const APP_ID: &str = "io.github.systemd_manager.SystemdManager";
+pub const APP_ID: &str = "io.github.systemd_manager.SystemdManager";
 
 fn main() -> glib::ExitCode {
     // Makes the X11 window class match the .desktop file name, so docks and
