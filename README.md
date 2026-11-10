@@ -63,7 +63,7 @@ Run the tests with `cargo test`.
 | --- | --- | --- |
 | systemd API | `src/systemd.rs` | Talks to `org.freedesktop.systemd1` over D-Bus with `zbus`, and listens for its change signals. Privileged calls set the *allow interactive authorization* flag so polkit can prompt. |
 | Journal | `src/journal.rs` | Runs `journalctl -f -u <unit>` (with `--user` for user services) and streams its output into the view. |
-| Main window | `src/window.rs` | Holds the list, the status, journal and unit file tabs, and the action buttons. D-Bus calls run on worker threads, so the UI never blocks. |
+| Main window | `src/window.rs` | Holds the list, the status, journal and unit file tabs, and the action buttons. The list is a `GtkListView` that creates rows only for what is on screen and updates changed services in place. D-Bus calls run on worker threads, so the UI never blocks. |
 | New service dialog | `src/new_service.rs` | Renders the form into a unit file (and a timer, when scheduled), writes it, runs daemon-reload, then optionally enables and starts it. |
 | Timers dialog | `src/timers.rs` | Lists timers with their next and last run. |
 

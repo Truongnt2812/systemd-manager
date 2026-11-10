@@ -119,7 +119,7 @@ impl Bus {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Service {
     pub name: String,
     pub description: String,
@@ -128,6 +128,13 @@ pub struct Service {
     pub sub_state: String,
     /// enabled / disabled / static / masked / ... (empty for transient units)
     pub file_state: String,
+}
+
+impl Service {
+    /// Order of the service list: case-insensitive by name, ties broken by exact name.
+    pub fn sort_key(&self) -> (String, &str) {
+        (self.name.to_lowercase(), &self.name)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -420,7 +427,7 @@ pub fn list_services(bus: Bus) -> Res<Vec<Service>> {
         }
     }
     let mut services: Vec<Service> = map.into_values().collect();
-    services.sort_by_key(|s| s.name.to_lowercase());
+    services.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
     Ok(services)
 }
 

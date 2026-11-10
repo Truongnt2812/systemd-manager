@@ -80,7 +80,11 @@ pub struct Window {
     user_btn: gtk::ToggleButton,
     toasts: adw::ToastOverlay,
     split: adw::NavigationSplitView,
-    list: gtk::ListBox,
+    list: gtk::ListView,
+    /// Every service of the current bus, as `BoxedAnyObject`s holding a `Service`.
+    store: gio::ListStore,
+    list_filter: gtk::CustomFilter,
+    selection: gtk::SingleSelection,
     search: gtk::SearchEntry,
     filter: gtk::DropDown,
     count_label: gtk::Label,
@@ -171,53 +175,136 @@ fn scrolled(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
         .build()
 }
 
-fn service_row(s: &Service) -> gtk::ListBoxRow {
-    let name = gtk::Label::builder()
-        .label(&s.name)
-        .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
-        .build();
-    let subtitle = if !s.description.is_empty() && s.description != s.name {
+fn service_subtitle(s: &Service) -> String {
+    if !s.description.is_empty() && s.description != s.name {
         s.description.clone()
     } else if !s.file_state.is_empty() {
         format!("{} · {}", s.load_state, s.file_state)
     } else {
         s.load_state.clone()
-    };
-    let desc = gtk::Label::builder()
-        .label(&subtitle)
-        .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
-        .css_classes(["dim-label", "caption"])
-        .build();
-    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    text.set_hexpand(true);
-    text.append(&name);
-    text.append(&desc);
+    }
+}
 
-    let state = gtk::Label::builder()
-        .label(&s.active_state)
-        .css_classes(["caption", state_class(&s.active_state)])
-        .valign(gtk::Align::Center)
-        .build();
+/// changes as possible: unchanged rows are left alone and only changed services
+/// are replaced, so the scroll position survives a refresh.
+/// in place, so the selection and scroll position survive a refresh.
+fn merge_services(store: &gio::ListStore, services: &[Service]) {
+    let item = |pos: u32| store.item(pos).and_downcast::<glib::BoxedAnyObject>();
+    let mut pos = 0u32;
+    for s in services {
+        loop {
+            let Some(obj) = item(pos) else {
+                store.append(&glib::BoxedAnyObject::new(s.clone()));
+                pos += 1;
+                break;
+            };
+            let order = obj.borrow::<Service>().sort_key().cmp(&s.sort_key());
+            match order {
+                // The service at `pos` is gone.
+                std::cmp::Ordering::Less => store.remove(pos),
+                std::cmp::Ordering::Equal => {
+                    let changed = *obj.borrow::<Service>() != *s;
+                    if changed {
+                        // A new object: the list view keeps a row as it is when it
+                        // gets the same object back. The caller restores the selection.
+                        store.splice(pos, 1, &[glib::BoxedAnyObject::new(s.clone())]);
+                    }
+                    pos += 1;
+                    break;
+                }
+                std::cmp::Ordering::Greater => {
+                    store.insert(pos, &glib::BoxedAnyObject::new(s.clone()));
+                    pos += 1;
+                    break;
+                }
+            }
+        }
+    }
+    let extra = store.n_items().saturating_sub(pos);
+    if extra > 0 {
+        store.splice(pos, extra, &[] as &[glib::Object]);
+    }
+}
 
-    let hbox = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .margin_top(6)
-        .margin_bottom(6)
-        .margin_start(4)
-        .margin_end(4)
-        .build();
-    hbox.append(&text);
-    hbox.append(&state);
-
-    let row = gtk::ListBoxRow::builder().child(&hbox).build();
-    row.set_tooltip_text(Some(&format!(
-        "{} — {} ({})",
-        s.name, s.active_state, s.sub_state
-    )));
-    row
+/// Builds the widgets of a service row once; `bind_service_row` fills them in.
+/// A click on a row also opens its details when the window is narrow.
+fn service_row_factory(split: &adw::NavigationSplitView) -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    let split = split.downgrade();
+    factory.connect_setup(move |_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let name = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        let desc = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        text.set_hexpand(true);
+        text.append(&name);
+        text.append(&desc);
+        let state = gtk::Label::builder()
+            .css_classes(["caption"])
+            .valign(gtk::Align::Center)
+            .build();
+        let hbox = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(4)
+            .margin_end(4)
+            .build();
+        hbox.append(&text);
+        hbox.append(&state);
+        let click = gtk::GestureClick::new();
+        let split = split.clone();
+        click.connect_released(move |_, _, _, _| {
+            if let Some(split) = split.upgrade() {
+                split.set_show_content(true);
+            }
+        });
+        hbox.add_controller(click);
+        item.set_child(Some(&hbox));
+    });
+    factory.connect_bind(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let (Some(obj), Some(hbox)) = (
+            item.item().and_downcast::<glib::BoxedAnyObject>(),
+            item.child(),
+        ) else {
+            return;
+        };
+        let s = obj.borrow::<Service>();
+        let text = hbox.first_child();
+        let name = text.as_ref().and_then(|t| t.first_child());
+        let desc = name.as_ref().and_then(|n| n.next_sibling());
+        let state = hbox.last_child();
+        for (widget, label) in [
+            (name, s.name.clone()),
+            (desc, service_subtitle(&s)),
+            (state.clone(), s.active_state.clone()),
+        ] {
+            if let Some(l) = widget.and_downcast::<gtk::Label>() {
+                l.set_label(&label);
+            }
+        }
+        if let Some(state) = state {
+            state.set_css_classes(&["caption", state_class(&s.active_state)]);
+        }
+        hbox.set_tooltip_text(Some(&format!(
+            "{} — {} ({})",
+            s.name, s.active_state, s.sub_state
+        )));
+    });
+    factory
 }
 
 impl Window {
@@ -273,9 +360,20 @@ impl Window {
         filter_box.append(&search);
         filter_box.append(&filter);
 
-        let list = gtk::ListBox::new();
-        list.add_css_class("navigation-sidebar");
-        list.set_selection_mode(gtk::SelectionMode::Single);
+        // Rows are created only for visible services and only changed ones are replaced, so a
+        // refresh doesn't rebuild hundreds of widgets or lose the scroll position.
+        let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let list_filter = gtk::CustomFilter::new(|_| true);
+        let filtered = gtk::FilterListModel::new(Some(store.clone()), Some(list_filter.clone()));
+        let selection = gtk::SingleSelection::builder()
+            .model(&filtered)
+            .autoselect(false)
+            .can_unselect(true)
+            .build();
+        let list = gtk::ListView::builder()
+            .model(&selection)
+            .css_classes(["navigation-sidebar"])
+            .build();
         let list_scroll = scrolled(&list);
         list_scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
 
@@ -631,6 +729,7 @@ impl Window {
         split.set_min_sidebar_width(300.0);
         split.set_sidebar_width_fraction(0.3);
         split.set_max_sidebar_width(420.0);
+        list.set_factory(Some(&service_row_factory(&split)));
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&split));
 
@@ -656,6 +755,9 @@ impl Window {
             toasts,
             split,
             list,
+            store,
+            list_filter,
+            selection,
             search,
             filter,
             count_label,
@@ -740,8 +842,11 @@ impl Window {
         });
 
         let weak = Rc::downgrade(&w);
-        w.list
-            .set_filter_func(move |row| weak.upgrade().is_none_or(|w| w.row_visible(row.index())));
+        w.list_filter.set_filter_func(move |obj| {
+            let Some(w) = weak.upgrade() else { return true };
+            obj.downcast_ref::<glib::BoxedAnyObject>()
+                .is_none_or(|b| w.matches(&b.borrow::<Service>()))
+        });
         let weak = Rc::downgrade(&w);
         w.search.connect_search_changed(move |_| {
             if let Some(w) = weak.upgrade() {
@@ -755,18 +860,15 @@ impl Window {
             }
         });
         let weak = Rc::downgrade(&w);
-        w.list.connect_row_selected(move |_, row| {
-            let (Some(w), Some(row)) = (weak.upgrade(), row) else {
-                return;
-            };
+        w.selection.connect_selected_item_notify(move |sel| {
+            let Some(w) = weak.upgrade() else { return };
             if w.rebuilding.get() {
                 return;
             }
-            let name = w
-                .services
-                .borrow()
-                .get(row.index() as usize)
-                .map(|s| s.name.clone());
+            let name = sel
+                .selected_item()
+                .and_downcast::<glib::BoxedAnyObject>()
+                .map(|b| b.borrow::<Service>().name.clone());
             let Some(name) = name else { return };
             if w.selected.borrow().as_deref() == Some(name.as_str()) {
                 return;
@@ -774,7 +876,7 @@ impl Window {
             w.confirm_discard(move |w| w.select(name), |w| w.reselect_current());
         });
         let weak = Rc::downgrade(&w);
-        w.list.connect_row_activated(move |_, _| {
+        w.list.connect_activate(move |_, _| {
             if let Some(w) = weak.upgrade() {
                 w.split.set_show_content(true);
             }
@@ -965,7 +1067,7 @@ impl Window {
         self.bus.set(bus);
         self.clear_selection();
         self.services.borrow_mut().clear();
-        self.list.remove_all();
+        self.store.remove_all();
         self.update_count();
         self.refresh_list();
     }
@@ -1037,46 +1139,66 @@ impl Window {
 
     fn set_services(self: &Rc<Self>, services: Vec<Service>) {
         self.rebuilding.set(true);
-        let rows: Vec<_> = services.iter().map(service_row).collect();
+        merge_services(&self.store, &services);
         self.services.replace(services);
-        self.list.remove_all();
-        for row in &rows {
-            self.list.append(row);
-        }
-        let pending = self.pending_select.take();
-        let wanted = pending.clone().or_else(|| self.selected.borrow().clone());
-        if let Some(name) = &wanted {
-            let idx = self.services.borrow().iter().position(|s| &s.name == name);
-            if let Some(row) = idx.and_then(|i| self.list.row_at_index(i as i32)) {
-                self.list.select_row(Some(&row));
-                if pending.is_some() {
-                    row.grab_focus();
-                }
-            }
-        }
         self.rebuilding.set(false);
         self.update_count();
-        if let Some(name) = pending {
-            self.confirm_discard(
-                move |w| {
-                    w.select(name);
-                    w.split.set_show_content(true);
-                },
-                |w| w.reselect_current(),
-            );
+
+        let Some(name) = self.pending_select.take() else {
+            self.reselect_current();
+            return;
+        };
+        // A service we were asked to show (e.g. one just created) may be hidden by
+        // the search or filter; clear them so it can be selected.
+        if self.position_of(&name).is_none()
+            && self.services.borrow().iter().any(|s| s.name == name)
+        {
+            self.search.set_text("");
+            self.filter.set_selected(0);
+            self.refilter();
         }
+        self.confirm_discard(
+            move |w| {
+                w.select(name);
+                w.reselect_current();
+                if let Some(pos) = w
+                    .selected
+                    .borrow()
+                    .as_deref()
+                    .and_then(|n| w.position_of(n))
+                {
+                    w.list.scroll_to(pos, gtk::ListScrollFlags::FOCUS, None);
+                }
+                w.split.set_show_content(true);
+            },
+            |w| w.reselect_current(),
+        );
     }
 
-    /// Highlights the selected service's row again, e.g. after the user cancels
-    /// switching to another service.
+    /// Position of a service among the rows shown (after search and filter).
+    fn position_of(&self, name: &str) -> Option<u32> {
+        (0..self.selection.n_items()).find(|&i| {
+            self.selection
+                .item(i)
+                .and_downcast::<glib::BoxedAnyObject>()
+                .is_some_and(|b| b.borrow::<Service>().name == name)
+        })
+    }
+
+    /// Highlights the selected service's row again, e.g. after a refresh, a new
+    /// search, or when the user cancels switching to another service.
     fn reselect_current(&self) {
-        let name = self.selected.borrow().clone();
-        let idx = name.and_then(|n| self.services.borrow().iter().position(|s| s.name == n));
-        self.rebuilding.set(true);
-        match idx.and_then(|i| self.list.row_at_index(i as i32)) {
-            Some(row) => self.list.select_row(Some(&row)),
-            None => self.list.unselect_all(),
+        let pos = self
+            .selected
+            .borrow()
+            .as_deref()
+            .and_then(|n| self.position_of(n))
+            .unwrap_or(gtk::INVALID_LIST_POSITION);
+        if self.selection.selected() == pos {
+            return;
         }
+        self.rebuilding.set(true);
+        self.selection.set_selected(pos);
         self.rebuilding.set(false);
     }
 
@@ -1118,14 +1240,6 @@ impl Window {
         );
     }
 
-    fn row_visible(&self, index: i32) -> bool {
-        let services = self.services.borrow();
-        let Some(s) = services.get(index as usize) else {
-            return true;
-        };
-        self.matches(s)
-    }
-
     fn matches(&self, s: &Service) -> bool {
         let query = self.search.text().to_lowercase();
         if !query.is_empty()
@@ -1144,8 +1258,11 @@ impl Window {
     }
 
     fn refilter(&self) {
-        self.list.invalidate_filter();
+        self.rebuilding.set(true);
+        self.list_filter.changed(gtk::FilterChange::Different);
+        self.rebuilding.set(false);
         self.update_count();
+        self.reselect_current();
     }
 
     fn update_count(&self) {
@@ -1380,7 +1497,7 @@ impl Window {
         self.content_stack.set_visible_child_name("empty");
         self.content_page.set_title("Service");
         self.split.set_show_content(false);
-        self.list.unselect_all();
+        self.reselect_current();
     }
 
     /// Runs `action` on the selected service, asking first when it is risky.
@@ -1870,4 +1987,50 @@ fn original_unit_text(fragment: &str, drop_ins: &[String], ours: &Path) -> Strin
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn svc(name: &str, state: &str) -> Service {
+        Service {
+            name: name.into(),
+            active_state: state.into(),
+            ..Default::default()
+        }
+    }
+
+    fn names(store: &gio::ListStore) -> Vec<String> {
+        (0..store.n_items())
+            .filter_map(|i| store.item(i).and_downcast::<glib::BoxedAnyObject>())
+            .map(|b| {
+                let s = b.borrow::<Service>();
+                format!("{}:{}", s.name, s.active_state)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merges_services_in_place() {
+        let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        merge_services(&store, &[svc("a", "active"), svc("c", "inactive")]);
+        assert_eq!(names(&store), ["a:active", "c:inactive"]);
+        let a = store.item(0).unwrap();
+
+        // Insert b, change c, remove nothing; a keeps its object.
+        merge_services(
+            &store,
+            &[svc("a", "active"), svc("b", "active"), svc("c", "failed")],
+        );
+        assert_eq!(names(&store), ["a:active", "b:active", "c:failed"]);
+        assert_eq!(store.item(0).unwrap(), a);
+
+        // Remove a and c, add d at the end.
+        merge_services(&store, &[svc("b", "active"), svc("d", "active")]);
+        assert_eq!(names(&store), ["b:active", "d:active"]);
+
+        merge_services(&store, &[]);
+        assert_eq!(store.n_items(), 0);
+    }
 }
