@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
+use sourceview5::prelude::*;
 
 use crate::journal::{self, JournalStream};
 use crate::new_service;
@@ -142,13 +143,13 @@ pub struct Window {
     journal_priority: gtk::DropDown,
     journal_boot: gtk::DropDown,
     journal_since: gtk::DropDown,
-    unit_view: gtk::TextView,
+    unit_view: sourceview5::View,
     unit_banner: adw::Banner,
     unit_path_label: gtk::Label,
     unit_save: gtk::Button,
     unit_revert: gtk::Button,
     unit_original_btn: gtk::ToggleButton,
-    unit_original_view: gtk::TextView,
+    unit_original_view: sourceview5::View,
     unit_stack: gtk::Stack,
 
     bus: Cell<Bus>,
@@ -211,6 +212,45 @@ fn scrolled(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
         .child(child)
         .vexpand(true)
         .hexpand(true)
+        .build()
+}
+
+/// A source view for unit files: INI highlighting (unit files use that syntax),
+/// line numbers, and a color scheme that follows the light/dark style.
+fn unit_file_view(editable: bool) -> sourceview5::View {
+    let buffer = sourceview5::Buffer::new(None);
+    if let Some(lang) = sourceview5::LanguageManager::default().language("ini") {
+        buffer.set_language(Some(&lang));
+    }
+    buffer.set_highlight_matching_brackets(false);
+    let apply_scheme = {
+        let buffer = buffer.clone();
+        move |style: &adw::StyleManager| {
+            let name = if style.is_dark() {
+                "Adwaita-dark"
+            } else {
+                "Adwaita"
+            };
+            if let Some(scheme) = sourceview5::StyleSchemeManager::default().scheme(name) {
+                buffer.set_style_scheme(Some(&scheme));
+            }
+        }
+    };
+    let style = adw::StyleManager::default();
+    apply_scheme(&style);
+    style.connect_dark_notify(apply_scheme);
+
+    sourceview5::View::builder()
+        .buffer(&buffer)
+        .editable(editable)
+        .monospace(true)
+        .show_line_numbers(true)
+        .highlight_current_line(editable)
+        .tab_width(4)
+        .top_margin(8)
+        .bottom_margin(8)
+        .left_margin(8)
+        .right_margin(8)
         .build()
 }
 
@@ -665,13 +705,7 @@ impl Window {
         journal_box.append(&scrolled(&journal_view));
 
         // ---- Unit file tab -------------------------------------------------
-        let unit_view = gtk::TextView::builder()
-            .monospace(true)
-            .top_margin(8)
-            .bottom_margin(8)
-            .left_margin(8)
-            .right_margin(8)
-            .build();
+        let unit_view = unit_file_view(true);
         let unit_banner = adw::Banner::new("");
         let unit_path_label = gtk::Label::builder()
             .css_classes(["dim-label", "caption"])
@@ -709,14 +743,7 @@ impl Window {
         unit_bar.append(&unit_original_btn);
         unit_bar.append(&unit_revert);
         unit_bar.append(&unit_save);
-        let unit_original_view = gtk::TextView::builder()
-            .monospace(true)
-            .editable(false)
-            .top_margin(8)
-            .bottom_margin(8)
-            .left_margin(8)
-            .right_margin(8)
-            .build();
+        let unit_original_view = unit_file_view(false);
         let unit_stack = gtk::Stack::new();
         unit_stack.add_named(&scrolled(&unit_view), Some("edit"));
         unit_stack.add_named(&scrolled(&unit_original_view), Some("original"));
@@ -1933,6 +1960,8 @@ impl Window {
         let bus = self.bus.get();
         let target = systemd::edit_target(bus, name, fragment);
         self.unit_loading.set(true);
+        // Loading a file is not something Ctrl+Z should undo.
+        buffer.begin_irreversible_action();
         let mut editable = true;
         let mut drop_in = false;
         if fragment == "/dev/null" || d.load_state == "masked" {
@@ -1961,6 +1990,7 @@ impl Window {
                 }
             }
         }
+        buffer.end_irreversible_action();
         self.unit_loading.set(false);
         self.unit_dirty.set(false);
         self.unit_view.set_editable(editable);

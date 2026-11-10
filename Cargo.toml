@@ -10,6 +10,7 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 async-channel = "2"
+sourceview5 = "0.11"
 serde = "1"
 
 [package.metadata.deb]

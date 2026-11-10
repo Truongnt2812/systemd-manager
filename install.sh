@@ -12,6 +12,7 @@ BIN_NAME="systemd-manager"
 MIN_RUST="1.92"
 MIN_GTK="4.14"
 MIN_ADW="1.5"
+MIN_SOURCEVIEW="5.0"
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="/usr/local"
@@ -70,6 +71,7 @@ missing_libs() {
     command -v pkg-config >/dev/null || return 0
     pkg-config --atleast-version="$MIN_GTK" gtk4 || return 0
     pkg-config --atleast-version="$MIN_ADW" libadwaita-1 || return 0
+    pkg-config --atleast-version="$MIN_SOURCEVIEW" gtksourceview-5 || return 0
     command -v cc >/dev/null || return 0
     return 1
 }
@@ -78,20 +80,20 @@ install_libs() {
     local root=""
     [[ $EUID -ne 0 ]] && root="sudo"
     if command -v apt-get >/dev/null; then
-        $root apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev
+        $root apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev libgtksourceview-5-dev
     elif command -v dnf >/dev/null; then
-        $root dnf install -y gcc pkgconf-pkg-config gtk4-devel libadwaita-devel
+        $root dnf install -y gcc pkgconf-pkg-config gtk4-devel libadwaita-devel gtksourceview5-devel
     elif command -v pacman >/dev/null; then
-        $root pacman -S --needed --noconfirm base-devel pkgconf gtk4 libadwaita
+        $root pacman -S --needed --noconfirm base-devel pkgconf gtk4 libadwaita gtksourceview5
     elif command -v zypper >/dev/null; then
-        $root zypper install -y gcc pkg-config gtk4-devel libadwaita-devel
+        $root zypper install -y gcc pkg-config gtk4-devel libadwaita-devel gtksourceview5-devel
     else
-        die "Install the GTK 4 and libadwaita development packages, a C compiler and pkg-config, then run this again."
+        die "Install the GTK 4, libadwaita and GtkSourceView 5 development packages, a C compiler and pkg-config, then run this again."
     fi
 }
 
 if missing_libs; then
-    [[ $INSTALL_DEPS -eq 1 ]] || die "GTK >= $MIN_GTK and libadwaita >= $MIN_ADW development files are needed."
+    [[ $INSTALL_DEPS -eq 1 ]] || die "GTK >= $MIN_GTK, libadwaita >= $MIN_ADW and GtkSourceView 5 development files are needed."
     say "Installing build dependencies (GTK 4, libadwaita, compiler)"
     install_libs
     missing_libs && die "Your distribution provides GTK $(pkg-config --modversion gtk4 2>/dev/null || echo '?') / libadwaita $(pkg-config --modversion libadwaita-1 2>/dev/null || echo '?'), but GTK >= $MIN_GTK and libadwaita >= $MIN_ADW are required."
