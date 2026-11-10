@@ -66,6 +66,36 @@ impl Bus {
         }
     }
 
+    /// Directories that hold unit files installed by packages or generated at runtime.
+    /// Units found there are never edited in place.
+    pub fn vendor_dirs(self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = match self {
+            Bus::System => [
+                "/usr/lib/systemd/system",
+                "/lib/systemd/system",
+                "/usr/local/lib/systemd/system",
+                "/run/systemd/system",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .collect(),
+            Bus::User => [
+                "/usr/lib/systemd/user",
+                "/usr/local/lib/systemd/user",
+                "/etc/systemd/user",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .collect(),
+        };
+        if self == Bus::User {
+            if let Some(home) = std::env::var_os("HOME") {
+                dirs.push(PathBuf::from(home).join(".local/share/systemd/user"));
+            }
+        }
+        dirs
+    }
+
     pub fn default_target(self) -> &'static str {
         match self {
             Bus::System => "multi-user.target",
@@ -93,6 +123,8 @@ pub struct Details {
     pub sub_state: String,
     pub file_state: String,
     pub fragment_path: String,
+    /// Drop-in files (`<unit>.d/*.conf`) applied on top of the unit file.
+    pub drop_in_paths: Vec<String>,
     pub main_pid: u32,
     pub memory: Option<u64>,
     /// Microseconds since the epoch at which the unit last entered the active state.
@@ -233,6 +265,9 @@ pub fn details(bus: Bus, name: &str) -> Res<Details> {
         sub_state: s("SubState"),
         file_state: s("UnitFileState"),
         fragment_path: s("FragmentPath"),
+        drop_in_paths: unit
+            .get_property::<Vec<String>>("DropInPaths")
+            .unwrap_or_default(),
         main_pid: svc.get_property::<u32>("MainPID").unwrap_or(0),
         memory,
         active_since: unit
@@ -323,14 +358,100 @@ pub fn watch(bus: Bus, on_change: impl Fn()) -> Res<()> {
     Err("lost connection to systemd".into())
 }
 
-/// Where an edited copy of a unit should be saved. Vendor units (e.g. under
-/// /usr/lib) are never modified in place; an override copy goes to the admin dir.
-pub fn editable_path(bus: Bus, name: &str, fragment: &str) -> PathBuf {
+/// Where edits to a unit are saved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditTarget {
+    /// The unit file lives in the admin directory, so it is edited directly.
+    File(PathBuf),
+    /// A vendor unit (e.g. under /usr/lib). It is never modified in place; edits go
+    /// into a drop-in that overrides only the settings it lists, the way
+    /// `systemctl edit` does, so package updates to the unit still apply.
+    DropIn(PathBuf),
+}
+
+impl EditTarget {
+    pub fn path(&self) -> &Path {
+        match self {
+            EditTarget::File(p) | EditTarget::DropIn(p) => p,
+        }
+    }
+}
+
+pub fn edit_target(bus: Bus, name: &str, fragment: &str) -> EditTarget {
     let dir = bus.unit_dir();
     if !fragment.is_empty() && Path::new(fragment).starts_with(&dir) {
-        PathBuf::from(fragment)
+        EditTarget::File(PathBuf::from(fragment))
     } else {
-        dir.join(name)
+        EditTarget::DropIn(dir.join(format!("{name}.d")).join("override.conf"))
+    }
+}
+
+/// Local files that customize a vendor unit, i.e. what "Revert to vendor" removes:
+/// our drop-in override, and a full copy in the admin dir that shadows a vendor unit
+/// of the same name (older versions of this app saved edits that way).
+pub fn local_overrides(bus: Bus, name: &str, fragment: &str) -> Vec<PathBuf> {
+    overrides_in(
+        &bus.unit_dir(),
+        &bus.vendor_dirs(),
+        name,
+        fragment,
+        |p: &Path| p.exists(),
+    )
+}
+
+fn overrides_in(
+    admin: &Path,
+    vendor_dirs: &[PathBuf],
+    name: &str,
+    fragment: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let drop_in = admin.join(format!("{name}.d")).join("override.conf");
+    if exists(&drop_in) {
+        out.push(drop_in);
+    }
+    let copy = admin.join(name);
+    let shadows_vendor = vendor_dirs.iter().any(|d| exists(&d.join(name)));
+    if shadows_vendor && Path::new(fragment) == copy && exists(&copy) {
+        out.push(copy);
+    }
+    out
+}
+
+/// Deletes files, through pkexec for system units (unless we already run as root).
+pub fn remove_files(bus: Bus, paths: &[PathBuf]) -> Res<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    if bus == Bus::User || running_as_root() {
+        for p in paths {
+            match std::fs::remove_file(p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: {e}", p.display())),
+            }
+        }
+        return Ok(());
+    }
+    let out = Command::new("pkexec")
+        .args(["rm", "-f", "--"])
+        .args(paths)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("could not run pkexec: {e}"))?;
+    pkexec_result(&out)
+}
+
+fn pkexec_result(out: &std::process::Output) -> Res<()> {
+    if out.status.success() {
+        Ok(())
+    } else if matches!(out.status.code(), Some(126) | Some(127)) {
+        Err("Authorization was cancelled or denied".into())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 }
 
@@ -347,8 +468,15 @@ pub fn write_unit_file(bus: Bus, path: &Path, content: &str) -> Res<()> {
         }
         return std::fs::write(path, content).map_err(|e| format!("{}: {e}", path.display()));
     }
+    // One pkexec call creates the parent directory (needed for new drop-ins) and
+    // writes the file, so polkit asks only once.
     let mut child = Command::new("pkexec")
-        .arg("tee")
+        .args([
+            "/bin/sh",
+            "-c",
+            r#"mkdir -p -- "$(dirname -- "$1")" && cat > "$1""#,
+            "sh",
+        ])
         .arg(path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -362,13 +490,7 @@ pub fn write_unit_file(bus: Bus, path: &Path, content: &str) -> Res<()> {
         .write_all(content.as_bytes())
         .map_err(err)?;
     let out = child.wait_with_output().map_err(err)?;
-    if out.status.success() {
-        Ok(())
-    } else if matches!(out.status.code(), Some(126) | Some(127)) {
-        Err("Authorization was cancelled or denied".into())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
+    pkexec_result(&out)
 }
 
 fn running_as_root() -> bool {
@@ -462,18 +584,72 @@ mod tests {
     }
 
     #[test]
-    fn vendor_units_get_override_path() {
+    fn vendor_units_get_drop_in() {
         assert_eq!(
-            editable_path(
+            edit_target(
                 Bus::System,
                 "a.service",
                 "/usr/lib/systemd/system/a.service"
             ),
-            PathBuf::from("/etc/systemd/system/a.service")
+            EditTarget::DropIn(PathBuf::from(
+                "/etc/systemd/system/a.service.d/override.conf"
+            ))
         );
         assert_eq!(
-            editable_path(Bus::System, "a.service", "/etc/systemd/system/a.service"),
-            PathBuf::from("/etc/systemd/system/a.service")
+            edit_target(Bus::System, "a.service", "/etc/systemd/system/a.service"),
+            EditTarget::File(PathBuf::from("/etc/systemd/system/a.service"))
         );
+    }
+
+    #[test]
+    fn finds_local_overrides() {
+        let admin = Path::new("/etc/systemd/system");
+        let vendor = [PathBuf::from("/usr/lib/systemd/system")];
+        let present = |files: &'static [&'static str]| {
+            move |p: &Path| files.iter().any(|f| p == Path::new(f))
+        };
+
+        // A drop-in on a vendor unit.
+        let files = &[
+            "/etc/systemd/system/a.service.d/override.conf",
+            "/usr/lib/systemd/system/a.service",
+        ];
+        assert_eq!(
+            overrides_in(
+                admin,
+                &vendor,
+                "a.service",
+                "/usr/lib/systemd/system/a.service",
+                present(files)
+            ),
+            vec![PathBuf::from(
+                "/etc/systemd/system/a.service.d/override.conf"
+            )]
+        );
+        // A full copy shadowing a vendor unit.
+        let files = &[
+            "/etc/systemd/system/a.service",
+            "/usr/lib/systemd/system/a.service",
+        ];
+        assert_eq!(
+            overrides_in(
+                admin,
+                &vendor,
+                "a.service",
+                "/etc/systemd/system/a.service",
+                present(files)
+            ),
+            vec![PathBuf::from("/etc/systemd/system/a.service")]
+        );
+        // A unit the admin created: nothing to revert to.
+        let files = &["/etc/systemd/system/a.service"];
+        assert!(overrides_in(
+            admin,
+            &vendor,
+            "a.service",
+            "/etc/systemd/system/a.service",
+            present(files)
+        )
+        .is_empty());
     }
 }

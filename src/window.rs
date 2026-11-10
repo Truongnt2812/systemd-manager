@@ -10,7 +10,7 @@ use gtk::{gio, glib};
 
 use crate::journal::{self, JournalStream};
 use crate::new_service;
-use crate::systemd::{self, Action, Bus, Details, Res, Service};
+use crate::systemd::{self, Action, Bus, Details, EditTarget, Res, Service};
 
 const FILTERS: [&str; 5] = ["All", "Running", "Failed", "Inactive", "Enabled"];
 const JOURNAL_LINES: [u32; 4] = [100, 500, 2000, 10000];
@@ -77,6 +77,10 @@ pub struct Window {
     unit_banner: adw::Banner,
     unit_path_label: gtk::Label,
     unit_save: gtk::Button,
+    unit_revert: gtk::Button,
+    unit_original_btn: gtk::ToggleButton,
+    unit_original_view: gtk::TextView,
+    unit_stack: gtk::Stack,
 
     bus: Cell<Bus>,
     services: RefCell<Vec<Service>>,
@@ -450,13 +454,37 @@ impl Window {
             .margin_top(6)
             .margin_bottom(6)
             .build();
+        let unit_revert = gtk::Button::builder()
+            .label("Revert to Vendor")
+            .css_classes(["destructive-action"])
+            .visible(false)
+            .tooltip_text("Remove your local overrides and go back to the packaged unit")
+            .build();
+        let unit_original_btn = gtk::ToggleButton::builder()
+            .label("Show Original")
+            .visible(false)
+            .tooltip_text("Show the packaged unit file and its other drop-ins (read only)")
+            .build();
         unit_bar.append(&unit_path_label);
+        unit_bar.append(&unit_original_btn);
+        unit_bar.append(&unit_revert);
         unit_bar.append(&unit_save);
+        let unit_original_view = gtk::TextView::builder()
+            .monospace(true)
+            .editable(false)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(8)
+            .right_margin(8)
+            .build();
+        let unit_stack = gtk::Stack::new();
+        unit_stack.add_named(&scrolled(&unit_view), Some("edit"));
+        unit_stack.add_named(&scrolled(&unit_original_view), Some("original"));
         let unit_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         unit_box.append(&unit_banner);
         unit_box.append(&unit_bar);
         unit_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        unit_box.append(&scrolled(&unit_view));
+        unit_box.append(&unit_stack);
 
         // ---- Content pane --------------------------------------------------
         let view_stack = adw::ViewStack::new();
@@ -553,6 +581,10 @@ impl Window {
             unit_banner,
             unit_path_label,
             unit_save,
+            unit_revert,
+            unit_original_btn,
+            unit_original_view,
+            unit_stack,
             bus: Cell::new(Bus::System),
             services: RefCell::new(Vec::new()),
             selected: RefCell::new(None),
@@ -750,6 +782,22 @@ impl Window {
         w.unit_save.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
                 w.save_unit();
+            }
+        });
+        let weak = Rc::downgrade(&w);
+        w.unit_revert.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.revert_unit();
+            }
+        });
+        let weak = Rc::downgrade(&w);
+        w.unit_original_btn.connect_toggled(move |btn| {
+            if let Some(w) = weak.upgrade() {
+                w.unit_stack.set_visible_child_name(if btn.is_active() {
+                    "original"
+                } else {
+                    "edit"
+                });
             }
         });
 
@@ -1313,8 +1361,11 @@ impl Window {
     fn load_unit_file(&self, name: &str, d: &Details) {
         let buffer = self.unit_view.buffer();
         let fragment = d.fragment_path.as_str();
+        let bus = self.bus.get();
+        let target = systemd::edit_target(bus, name, fragment);
         self.unit_loading.set(true);
         let mut editable = true;
+        let mut drop_in = false;
         if fragment == "/dev/null" || d.load_state == "masked" {
             buffer.set_text("# This service is masked. Unmask it to view or edit its unit file.\n");
             editable = false;
@@ -1322,11 +1373,22 @@ impl Window {
             buffer.set_text("# This unit has no unit file on disk.\n");
             editable = false;
         } else {
-            match systemd::read_file(fragment) {
-                Ok(text) => buffer.set_text(&text),
-                Err(e) => {
-                    buffer.set_text(&format!("# {e}\n"));
-                    editable = false;
+            match &target {
+                EditTarget::File(_) => match systemd::read_file(fragment) {
+                    Ok(text) => buffer.set_text(&text),
+                    Err(e) => {
+                        buffer.set_text(&format!("# {e}\n"));
+                        editable = false;
+                    }
+                },
+                EditTarget::DropIn(path) => {
+                    drop_in = true;
+                    let text = std::fs::read_to_string(path)
+                        .unwrap_or_else(|_| drop_in_template(name, fragment));
+                    buffer.set_text(&text);
+                    self.unit_original_view
+                        .buffer()
+                        .set_text(&original_unit_text(fragment, &d.drop_in_paths, path));
                 }
             }
         }
@@ -1334,19 +1396,95 @@ impl Window {
         self.unit_dirty.set(false);
         self.unit_view.set_editable(editable);
         self.unit_save.set_sensitive(false);
-        self.unit_path_label
-            .set_label(if fragment.is_empty() { "—" } else { fragment });
+        self.unit_original_btn.set_active(false);
+        self.unit_original_btn.set_visible(drop_in);
+        self.unit_stack.set_visible_child_name("edit");
+        let shown = if drop_in {
+            target.path().to_string_lossy().into_owned()
+        } else if fragment.is_empty() {
+            "—".to_string()
+        } else {
+            fragment.to_string()
+        };
+        self.unit_path_label.set_label(&shown);
 
-        let target = systemd::editable_path(self.bus.get(), name, fragment);
-        if editable && target != Path::new(fragment) {
+        let overrides = if editable {
+            systemd::local_overrides(bus, name, fragment)
+        } else {
+            Vec::new()
+        };
+        self.unit_revert.set_visible(!overrides.is_empty());
+        if drop_in {
             self.unit_banner.set_title(&format!(
-                "This is a vendor unit file. Saving writes an override copy to {}",
-                target.display()
+                "This is a vendor unit. Your changes are saved as a drop-in override at {}, so package updates still apply",
+                target.path().display()
             ));
+            self.unit_banner.set_revealed(true);
+        } else if !overrides.is_empty() {
+            self.unit_banner.set_title(
+                "This is a local copy that replaces a vendor unit. Package updates to it are ignored until you revert",
+            );
             self.unit_banner.set_revealed(true);
         } else {
             self.unit_banner.set_revealed(false);
         }
+    }
+
+    /// Asks, then removes the local overrides of the selected vendor unit.
+    fn revert_unit(self: &Rc<Self>) {
+        let Some(name) = self.selected.borrow().clone() else {
+            return;
+        };
+        let fragment = self
+            .details
+            .borrow()
+            .as_ref()
+            .map(|d| d.fragment_path.clone())
+            .unwrap_or_default();
+        let bus = self.bus.get();
+        let files = systemd::local_overrides(bus, &name, &fragment);
+        if files.is_empty() {
+            return;
+        }
+        let list: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+        let dialog = adw::AlertDialog::new(
+            Some(&format!("Revert {name}?")),
+            Some(&format!(
+                "This deletes your local changes and goes back to the packaged unit:\n\n{}",
+                list.join("\n")
+            )),
+        );
+        dialog.add_responses(&[("cancel", "_Cancel"), ("revert", "_Revert")]);
+        dialog.set_response_appearance("revert", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let weak = Rc::downgrade(self);
+        dialog.choose(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |response| {
+                if response != "revert" {
+                    return;
+                }
+                background(
+                    move || -> Res<()> {
+                        systemd::remove_files(bus, &files)?;
+                        systemd::daemon_reload(bus)
+                    },
+                    move |res| {
+                        let Some(w) = weak.upgrade() else { return };
+                        match res {
+                            Ok(()) => {
+                                w.toast(&format!("Reverted {name} to the vendor unit"));
+                                w.unit_dirty.set(false);
+                                w.load_details(true);
+                            }
+                            Err(e) => w.toast(&format!("Could not revert: {e}")),
+                        }
+                    },
+                );
+            },
+        );
     }
 
     fn save_unit(self: &Rc<Self>) {
@@ -1360,7 +1498,9 @@ impl Window {
             .map(|d| d.fragment_path.clone())
             .unwrap_or_default();
         let bus = self.bus.get();
-        let target = systemd::editable_path(bus, &name, &fragment);
+        let target = systemd::edit_target(bus, &name, &fragment)
+            .path()
+            .to_path_buf();
         let buffer = self.unit_view.buffer();
         let text = buffer
             .text(&buffer.start_iter(), &buffer.end_iter(), false)
@@ -1388,4 +1528,43 @@ impl Window {
             },
         );
     }
+}
+
+/// Starting text for a new drop-in override of a vendor unit.
+fn drop_in_template(name: &str, fragment: &str) -> String {
+    format!(
+        "# Drop-in override for {name}.\n\
+         # Settings here are applied on top of {fragment};\n\
+         # anything you don't list keeps its packaged value.\n\
+         #\n\
+         # Add the section header for each setting, for example:\n\
+         #\n\
+         # [Service]\n\
+         # Environment=DEBUG=1\n\
+         #\n\
+         # To replace a list setting such as ExecStart, clear it first:\n\
+         # ExecStart=\n\
+         # ExecStart=/usr/bin/example --new-flag\n"
+    )
+}
+
+/// The vendor unit file followed by its other drop-ins, like `systemctl cat`.
+fn original_unit_text(fragment: &str, drop_ins: &[String], ours: &Path) -> String {
+    let mut out = String::new();
+    for path in std::iter::once(fragment).chain(
+        drop_ins
+            .iter()
+            .map(String::as_str)
+            .filter(|p| Path::new(p) != ours),
+    ) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out += &format!("# {path}\n");
+        match std::fs::read_to_string(path) {
+            Ok(text) => out += &text,
+            Err(e) => out += &format!("# could not read: {e}\n"),
+        }
+    }
+    out
 }
