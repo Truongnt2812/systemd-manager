@@ -35,6 +35,7 @@ for prefix in "${PREFIXES[@]}"; do
     found=0
     for f in "$prefix/bin/$BIN_NAME" \
              "$prefix/share/applications/$APP_ID.desktop" \
+             "$prefix/share/metainfo/$APP_ID.metainfo.xml" \
              "$prefix/share/icons/hicolor/scalable/apps/$APP_ID.svg" \
              "$prefix/share/icons/hicolor/48x48/apps/$APP_ID.png" \
              "$prefix/share/icons/hicolor/256x256/apps/$APP_ID.png"; do

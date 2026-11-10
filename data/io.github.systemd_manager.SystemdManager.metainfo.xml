@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.systemd_manager.SystemdManager</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Systemd Manager</name>
+  <summary>Start, stop, enable and inspect systemd services</summary>
+  <developer id="io.github.truongnt2812">
+    <name>Truong Nguyen</name>
+  </developer>
+  <description>
+    <p>
+      Systemd Manager is a desktop app for the services on your computer. It lists
+      every system and user service, updates live when they change, and lets you
+      control them without a terminal.
+    </p>
+    <ul>
+      <li>Start, stop, restart, reload, enable, disable, mask and unmask services</li>
+      <li>See why a service failed, with its exit code, CPU, memory and restarts</li>
+      <li>Follow the journal live, pause it, search it, filter it by priority, boot or time, and save it</li>
+      <li>Edit unit files with syntax highlighting; vendor units get a drop-in override that you can revert</li>
+      <li>Create services from a form, optionally run on a schedule with a timer</li>
+      <li>See all timers with their next and last run</li>
+    </ul>
+    <p>
+      Changes to system services ask for your password through polkit.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.systemd_manager.SystemdManager.desktop</launchable>
+  <url type="homepage">https://github.com/Truongnt2812/systemd-manager</url>
+  <url type="bugtracker">https://github.com/Truongnt2812/systemd-manager/issues</url>
+  <url type="vcs-browser">https://github.com/Truongnt2812/systemd-manager</url>
+  <categories>
+    <category>System</category>
+    <category>Settings</category>
+  </categories>
+  <keywords>
+    <keyword>systemd</keyword>
+    <keyword>service</keyword>
+    <keyword>daemon</keyword>
+    <keyword>journal</keyword>
+    <keyword>systemctl</keyword>
+  </keywords>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Status of a service</caption>
+      <image>https://raw.githubusercontent.com/Truongnt2812/systemd-manager/master/screenshots/status.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Live journal</caption>
+      <image>https://raw.githubusercontent.com/Truongnt2812/systemd-manager/master/screenshots/journal.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Searching the journal</caption>
+      <image>https://raw.githubusercontent.com/Truongnt2812/systemd-manager/master/screenshots/journal-search.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Editing a unit file</caption>
+      <image>https://raw.githubusercontent.com/Truongnt2812/systemd-manager/master/screenshots/unit-file.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Creating a new service</caption>
+      <image>https://raw.githubusercontent.com/Truongnt2812/systemd-manager/master/screenshots/new-service.png</image>
+    </screenshot>
+  </screenshots>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>systemd-manager</binary>
+  </provides>
+  <releases>
+    <release version="0.1.0" date="2026-10-13">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -60,7 +60,7 @@ sudo pacman -S base-devel gtk4 libadwaita gtksourceview5
 
 To remove it, run `bash uninstall.sh`. It finds every installed copy (in `~/.local`, `/usr/local` or `/usr`), lists what it will delete and asks first. Add `-y` to skip the question, or `--purge` to also delete the `target/` build output. Services you created with the app are left alone.
 
-The script installs missing build dependencies with your package manager (apt, dnf, pacman or zypper), updates Rust through rustup if it is too old, builds a release binary, and installs it with a desktop entry and icon, so Systemd Manager shows up in your app menu. If the file isn't executable after unpacking, run it as `bash install.sh`.
+The script installs missing build dependencies with your package manager (apt, dnf, pacman or zypper), updates Rust through rustup if it is too old, builds a release binary, and installs it with a desktop entry, icon and AppStream metainfo, so Systemd Manager shows up in your app menu and software centers can describe it. If the file isn't executable after unpacking, run it as `bash install.sh`.
 
 ## Build and run without installing
 

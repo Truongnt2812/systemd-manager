@@ -50,6 +50,7 @@ BIN_PATH="$PREFIX/bin/$BIN_NAME"
 DESKTOP_PATH="$PREFIX/share/applications/$APP_ID.desktop"
 ICON_DIR="$PREFIX/share/icons/hicolor"
 ICON_PATH="$ICON_DIR/scalable/apps/$APP_ID.svg"
+METAINFO_PATH="$PREFIX/share/metainfo/$APP_ID.metainfo.xml"
 
 refresh_caches() {
     if [[ -d "$PREFIX/share/applications" ]] && command -v update-desktop-database >/dev/null; then
@@ -130,6 +131,8 @@ done
 # Use the absolute binary path so the launcher works even if $PREFIX/bin isn't on PATH.
 sed "s|^Exec=.*|Exec=$BIN_PATH|" "$SRC_DIR/data/$APP_ID.desktop" \
     | $SUDO install -Dm644 /dev/stdin "$DESKTOP_PATH"
+# Lets software centers (GNOME Software, Discover) describe the app.
+$SUDO install -Dm644 "$SRC_DIR/data/$APP_ID.metainfo.xml" "$METAINFO_PATH"
 refresh_caches
 
 say "Installed Systemd Manager."
