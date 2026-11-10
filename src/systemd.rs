@@ -866,10 +866,87 @@ pub fn normalize_name(input: &str) -> Res<String> {
     Ok(name)
 }
 
+/// Directories systemd searches for commands that aren't given as absolute paths.
+const COMMAND_PATH: [&str; 6] = [
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+];
+
+/// Checks the program of an ExecStart=/ExecStop= line and returns the line with
+/// the program as an absolute path. Keeps systemd's prefixes (`-`, `@`, `+`, ...).
+pub fn resolve_command(line: &str) -> Res<String> {
+    let line = line.trim();
+    let body = line.trim_start_matches(['-', '@', ':', '+', '!']);
+    let prefix = &line[..line.len() - body.len()];
+    let (program, rest) = match body.split_once(char::is_whitespace) {
+        Some((p, r)) => (p, format!(" {}", r.trim_start())),
+        None => (body, String::new()),
+    };
+    if program.is_empty() {
+        return Err("Enter the command the service should run".into());
+    }
+    let path = if program.starts_with('/') {
+        PathBuf::from(program)
+    } else if program.contains('/') {
+        return Err(format!(
+            "Use an absolute path for {program}; systemd doesn't run commands from a working directory"
+        ));
+    } else {
+        COMMAND_PATH
+            .iter()
+            .map(|d| Path::new(d).join(program))
+            .find(|p| is_executable(p))
+            .ok_or_else(|| format!("Command not found: {program}"))?
+    };
+    if !path.exists() {
+        return Err(format!("{} does not exist", path.display()));
+    }
+    if !is_executable(&path) {
+        return Err(format!("{} is not an executable file", path.display()));
+    }
+    Ok(format!("{prefix}{}{rest}", path.display()))
+}
+
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Parses "KEY=value OTHER=value" into separate assignments.
+pub fn parse_environment(input: &str) -> Res<Vec<String>> {
+    input
+        .split_whitespace()
+        .map(|pair| {
+            let (key, _) = pair
+                .split_once('=')
+                .ok_or_else(|| format!("{pair}: environment variables are written KEY=value"))?;
+            let valid = key
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid {
+                return Err(format!("{key} is not a valid variable name"));
+            }
+            Ok(pair.to_string())
+        })
+        .collect()
+}
+
 pub struct NewService {
     pub name: String,
     pub description: String,
     pub exec_start: String,
+    /// Optional ExecStop= line.
+    pub exec_stop: String,
+    /// KEY=value assignments.
+    pub environment: Vec<String>,
+    /// Seconds to wait before restarting (0 = systemd's default).
+    pub restart_sec: u32,
     pub service_type: String,
     pub restart: String,
     pub working_dir: String,
@@ -891,6 +968,12 @@ pub fn render_unit(bus: Bus, s: &NewService) -> String {
     out += "\n[Service]\n";
     out += &format!("Type={}\n", s.service_type);
     out += &format!("ExecStart={}\n", s.exec_start);
+    if !s.exec_stop.is_empty() {
+        out += &format!("ExecStop={}\n", s.exec_stop);
+    }
+    for env in &s.environment {
+        out += &format!("Environment=\"{env}\"\n");
+    }
     if !s.working_dir.is_empty() {
         out += &format!("WorkingDirectory={}\n", s.working_dir);
     }
@@ -898,6 +981,9 @@ pub fn render_unit(bus: Bus, s: &NewService) -> String {
         out += &format!("User={}\n", s.user);
     }
     out += &format!("Restart={}\n", s.restart);
+    if s.restart != "no" && s.restart_sec > 0 {
+        out += &format!("RestartSec={}\n", s.restart_sec);
+    }
     if !s.wanted_by.is_empty() && s.schedule.is_none() {
         out += &format!("\n[Install]\nWantedBy={}\n", s.wanted_by);
     }
@@ -942,6 +1028,9 @@ mod tests {
             name: "demo.service".into(),
             description: "Demo".into(),
             exec_start: "/usr/bin/demo --flag".into(),
+            exec_stop: String::new(),
+            environment: vec!["PORT=8080".into()],
+            restart_sec: 5,
             service_type: "simple".into(),
             restart: "on-failure".into(),
             working_dir: String::new(),
@@ -952,6 +1041,9 @@ mod tests {
         let system = render_unit(Bus::System, &spec);
         assert!(system.contains("ExecStart=/usr/bin/demo --flag\n"));
         assert!(system.contains("User=nobody\n"));
+        assert!(system.contains("Environment=\"PORT=8080\"\n"));
+        assert!(system.contains("RestartSec=5\n"));
+        assert!(!system.contains("ExecStop="));
         assert!(system.ends_with("[Install]\nWantedBy=multi-user.target\n"));
         assert!(!render_unit(Bus::User, &spec).contains("User="));
         assert!(render_timer(&spec).is_none());
@@ -965,6 +1057,30 @@ mod tests {
         assert!(timer.contains("OnCalendar=daily\n"));
         assert!(timer.contains("Unit=demo.service\n"));
         assert!(timer.ends_with("WantedBy=timers.target\n"));
+    }
+
+    #[test]
+    fn resolves_commands() {
+        let sh = resolve_command("sh -c 'echo hi'").unwrap();
+        assert!(
+            sh.starts_with('/') && sh.ends_with("/sh -c 'echo hi'"),
+            "{sh}"
+        );
+        assert!(resolve_command("-sh").unwrap().starts_with("-/"));
+        assert!(resolve_command("/no/such/program").is_err());
+        assert!(resolve_command("bin/relative").is_err());
+        assert!(resolve_command("definitely-not-a-command-xyz").is_err());
+    }
+
+    #[test]
+    fn parses_environment() {
+        assert_eq!(
+            parse_environment(" A=1  B_2=x=y ").unwrap(),
+            vec!["A=1", "B_2=x=y"]
+        );
+        assert!(parse_environment("NOEQUALS").is_err());
+        assert!(parse_environment("1A=x").is_err());
+        assert!(parse_environment("").unwrap().is_empty());
     }
 
     #[test]
