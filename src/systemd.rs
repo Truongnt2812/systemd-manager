@@ -545,14 +545,20 @@ fn overrides_in(
     out
 }
 
-/// Deletes files, through pkexec for system units (unless we already run as root).
+/// Deletes files and directories, through pkexec for system units (unless we
+/// already run as root).
 pub fn remove_files(bus: Bus, paths: &[PathBuf]) -> Res<()> {
     if paths.is_empty() {
         return Ok(());
     }
     if bus == Bus::User || running_as_root() {
         for p in paths {
-            match std::fs::remove_file(p) {
+            let res = if p.is_dir() {
+                std::fs::remove_dir_all(p)
+            } else {
+                std::fs::remove_file(p)
+            };
+            match res {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("{}: {e}", p.display())),
@@ -561,7 +567,7 @@ pub fn remove_files(bus: Bus, paths: &[PathBuf]) -> Res<()> {
         return Ok(());
     }
     let out = Command::new("pkexec")
-        .args(["rm", "-f", "--"])
+        .args(["rm", "-rf", "--"])
         .args(paths)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -569,6 +575,46 @@ pub fn remove_files(bus: Bus, paths: &[PathBuf]) -> Res<()> {
         .output()
         .map_err(|e| format!("could not run pkexec: {e}"))?;
     pkexec_result(&out)
+}
+
+/// Whether `delete_service` may remove this unit: only units created locally in the
+/// admin directory, never vendor units or local copies that replace one.
+pub fn is_deletable(bus: Bus, name: &str, fragment: &str) -> bool {
+    !fragment.is_empty()
+        && Path::new(fragment).starts_with(bus.unit_dir())
+        && !local_overrides(bus, name, fragment)
+            .iter()
+            .any(|p| p == Path::new(fragment))
+}
+
+/// Files that make up a locally created unit: its file and its drop-in directory.
+pub fn unit_files(bus: Bus, name: &str, fragment: &str) -> Vec<PathBuf> {
+    let mut files = vec![PathBuf::from(fragment)];
+    let drop_ins = bus.unit_dir().join(format!("{name}.d"));
+    if drop_ins.exists() {
+        files.push(drop_ins);
+    }
+    files
+}
+
+/// Stops (if `running`) and disables a locally created service, deletes its files and
+/// reloads systemd.
+pub fn delete_service(bus: Bus, name: &str, fragment: &str, running: bool) -> Res<()> {
+    if !is_deletable(bus, name, fragment) {
+        return Err(format!("{name} is not a locally created unit"));
+    }
+    if running {
+        run_action(bus, name, Action::Stop)?;
+    }
+    let m = manager(bus)?;
+    let names = vec![name.to_string()];
+    // Fails harmlessly for units that have no [Install] section.
+    let _: Res<Vec<(String, String, String)>> = call_auth(&m, "DisableUnitFiles", &(&names, false));
+    remove_files(bus, &unit_files(bus, name, fragment))?;
+    daemon_reload(bus)?;
+    // Forget a failed state, so the unit disappears from the list.
+    let _: Res<()> = call_auth(&m, "ResetFailedUnit", &(name,));
+    Ok(())
 }
 
 fn pkexec_result(out: &std::process::Output) -> Res<()> {
@@ -726,6 +772,16 @@ mod tests {
         assert!(!ask(Bus::System, "sshd.service", Action::Stop, false));
         assert!(!ask(Bus::System, "sshd.service", Action::Start, false));
         assert!(!ask(Bus::User, "sshd.service", Action::Mask, true));
+    }
+
+    #[test]
+    fn only_local_units_are_deletable() {
+        assert!(!is_deletable(Bus::System, "a.service", ""));
+        assert!(!is_deletable(
+            Bus::System,
+            "a.service",
+            "/usr/lib/systemd/system/a.service"
+        ));
     }
 
     #[test]

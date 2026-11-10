@@ -50,6 +50,7 @@ struct ActionButtons {
     disable: gtk::Button,
     mask: gtk::Button,
     unmask: gtk::Button,
+    delete: gtk::Button,
 }
 
 pub struct Window {
@@ -285,7 +286,13 @@ impl Window {
             disable: icon_button("Disable", "window-close-symbolic"),
             mask: icon_button("Mask", "action-unavailable-symbolic"),
             unmask: icon_button("Unmask", "edit-undo-symbolic"),
+            delete: icon_button("Delete", "user-trash-symbolic"),
         };
+        buttons.delete.add_css_class("destructive-action");
+        buttons.delete.set_visible(false);
+        buttons.delete.set_tooltip_text(Some(
+            "Stop and disable the service and delete its unit file",
+        ));
         buttons
             .restart
             .set_tooltip_text(Some("Stop and start the service"));
@@ -309,6 +316,7 @@ impl Window {
         boot_box.append(&linked(&[&buttons.enable, &buttons.disable]));
         boot_box.append(&buttons.mask);
         boot_box.append(&buttons.unmask);
+        boot_box.append(&buttons.delete);
         run_box.set_halign(gtk::Align::Start);
         boot_box.set_halign(gtk::Align::Start);
 
@@ -697,6 +705,13 @@ impl Window {
         }
 
         let weak = Rc::downgrade(&w);
+        b.delete.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.delete_selected();
+            }
+        });
+
+        let weak = Rc::downgrade(&w);
         w.journal_pause.connect_toggled(move |btn| {
             if let Some(w) = weak.upgrade() {
                 if !btn.is_active() {
@@ -839,12 +854,7 @@ impl Window {
             return;
         }
         self.bus.set(bus);
-        self.selected.replace(None);
-        self.details.replace(None);
-        self.journal.replace(None);
-        self.content_stack.set_visible_child_name("empty");
-        self.content_page.set_title("Service");
-        self.split.set_show_content(false);
+        self.clear_selection();
         self.services.borrow_mut().clear();
         self.list.remove_all();
         self.update_count();
@@ -1151,6 +1161,87 @@ impl Window {
         b.disable.set_sensitive(enabled || d.file_state == "linked");
         b.mask.set_visible(!masked);
         b.unmask.set_visible(masked);
+        b.delete.set_visible(systemd::is_deletable(
+            self.bus.get(),
+            &name,
+            &d.fragment_path,
+        ));
+    }
+
+    /// Asks, then stops, disables and deletes the selected (locally created) service.
+    fn delete_selected(self: &Rc<Self>) {
+        let Some(name) = self.selected.borrow().clone() else {
+            return;
+        };
+        let Some((fragment, running)) = self.details.borrow().as_ref().map(|d| {
+            (
+                d.fragment_path.clone(),
+                matches!(
+                    d.active_state.as_str(),
+                    "active" | "reloading" | "activating"
+                ),
+            )
+        }) else {
+            return;
+        };
+        let bus = self.bus.get();
+        let files: Vec<String> = systemd::unit_files(bus, &name, &fragment)
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let dialog = adw::AlertDialog::new(
+            Some(&format!("Delete {name}?")),
+            Some(&format!(
+                "The service is stopped and disabled, and these files are deleted. This cannot be undone.\n\n{}",
+                files.join("\n")
+            )),
+        );
+        dialog.add_responses(&[("cancel", "_Cancel"), ("delete", "_Delete")]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let weak = Rc::downgrade(self);
+        dialog.choose(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |response| {
+                if response != "delete" {
+                    return;
+                }
+                let deleted = name.clone();
+                background(
+                    move || systemd::delete_service(bus, &name, &fragment, running),
+                    move |res| {
+                        let Some(w) = weak.upgrade() else { return };
+                        match res {
+                            Ok(()) => {
+                                w.toast(&format!("Deleted {deleted}"));
+                                if w.selected.borrow().as_deref() == Some(deleted.as_str()) {
+                                    w.clear_selection();
+                                }
+                                w.refresh_list();
+                            }
+                            Err(e) => {
+                                w.toast(&format!("Could not delete {deleted}: {e}"));
+                                w.load_details(false);
+                            }
+                        }
+                    },
+                );
+            },
+        );
+    }
+
+    /// Shows the "No Service Selected" page.
+    fn clear_selection(&self) {
+        self.selected.replace(None);
+        self.details.replace(None);
+        self.journal.replace(None);
+        self.unit_dirty.set(false);
+        self.content_stack.set_visible_child_name("empty");
+        self.content_page.set_title("Service");
+        self.split.set_show_content(false);
+        self.list.unselect_all();
     }
 
     /// Runs `action` on the selected service, asking first when it is risky.

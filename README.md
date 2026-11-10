@@ -14,6 +14,7 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 - **Journal** streams the unit's log live, starting from the last 100 to 10,000 lines. **Pause** freezes the view and keeps new lines until you **Resume**. **Find in log** highlights every match; Enter and Shift+Enter (or the arrows) jump between them.
 - **Unit File** lets you view and edit the unit, then **Save and Reload**, which writes the file and runs daemon-reload. Vendor units (e.g. under `/usr/lib/systemd`) are never modified in place. For those, the editor holds a drop-in override (`/etc/systemd/system/<unit>.d/override.conf`, or under `~/.config/systemd/user/`), the way `systemctl edit` does, so package updates to the unit still apply. **Show Original** shows the packaged file, and **Revert to Vendor** deletes your overrides. If you switch to another service or close the window with unsaved edits, the app asks before discarding them.
 - **New service** (the + button) creates a `.service` unit from a form (command, type, restart policy, working directory, user, WantedBy). It can also enable and start the service right away.
+- **Delete** removes a service you created (one whose unit file is in `/etc/systemd/system/` or `~/.config/systemd/user/`): it stops and disables it, deletes the unit file and its drop-ins, and reloads systemd. Vendor units can't be deleted.
 
 ## Requirements
 
