@@ -11,6 +11,7 @@ use gtk::{gio, glib};
 use crate::journal::{self, JournalStream};
 use crate::new_service;
 use crate::systemd::{self, Action, Bus, Details, EditTarget, Res, Service};
+use crate::timers;
 
 const FILTERS: [&str; 5] = ["All", "Running", "Failed", "Inactive", "Enabled"];
 const JOURNAL_LINES: [u32; 4] = [100, 500, 2000, 10000];
@@ -57,6 +58,7 @@ struct StatusRows {
     cpu: adw::ActionRow,
     tasks: adw::ActionRow,
     restarts: adw::ActionRow,
+    triggered_by: adw::ActionRow,
 }
 
 struct ActionButtons {
@@ -244,9 +246,14 @@ impl Window {
             .icon_name("list-add-symbolic")
             .tooltip_text("New service")
             .build();
+        let timers_btn = gtk::Button::builder()
+            .icon_name("alarm-symbolic")
+            .tooltip_text("Timers")
+            .build();
         let side_header = adw::HeaderBar::new();
         side_header.set_title_widget(Some(&bus_box));
         side_header.pack_start(&refresh_btn);
+        side_header.pack_start(&timers_btn);
         side_header.pack_end(&new_btn);
 
         let search = gtk::SearchEntry::builder()
@@ -369,6 +376,7 @@ impl Window {
             cpu: property_row("CPU time"),
             tasks: property_row("Tasks"),
             restarts: property_row("Automatic restarts"),
+            triggered_by: property_row("Started by"),
         };
         let status_group = adw::PreferencesGroup::new();
         for r in [
@@ -377,6 +385,7 @@ impl Window {
             &rows.result,
             &rows.last_exit,
             &rows.loaded,
+            &rows.triggered_by,
             &rows.since,
             &rows.pid,
             &rows.memory,
@@ -715,6 +724,12 @@ impl Window {
             if let Some(w) = weak.upgrade() {
                 w.refresh_list();
                 w.load_details(false);
+            }
+        });
+        let weak = Rc::downgrade(&w);
+        timers_btn.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                timers::show(&w);
             }
         });
         let weak = Rc::downgrade(&w);
@@ -1256,6 +1271,12 @@ impl Window {
             .tasks
             .set_subtitle(&d.tasks.map(|t| t.to_string()).unwrap_or_else(|| "—".into()));
         self.rows.restarts.set_subtitle(&d.n_restarts.to_string());
+        self.rows
+            .triggered_by
+            .set_visible(!d.triggered_by.is_empty());
+        self.rows
+            .triggered_by
+            .set_subtitle(&d.triggered_by.join(", "));
 
         let b = &self.buttons;
         let running = matches!(d.active_state.as_str(), "active" | "reloading");

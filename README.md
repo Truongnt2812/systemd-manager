@@ -13,7 +13,8 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 - **Status** shows active/sub state, why the service last stopped or failed (its result and the main process's exit code or signal), unit file state, active since, main PID, memory, CPU time, tasks, automatic restarts, and the unit file path. **Reset Failed** clears a failed state and the restart counter.
 - **Journal** streams the unit's log live, starting from the last 100 to 10,000 lines. **Pause** freezes the view and keeps new lines until you **Resume**. **Find in log** highlights every match; Enter and Shift+Enter (or the arrows) jump between them. **Filters** narrows the log by priority (warnings and errors, or errors only), to the current boot, or to a recent time range, and the save button writes the log to a file.
 - **Unit File** lets you view and edit the unit, then **Save and Reload**, which writes the file and runs daemon-reload. Vendor units (e.g. under `/usr/lib/systemd`) are never modified in place. For those, the editor holds a drop-in override (`/etc/systemd/system/<unit>.d/override.conf`, or under `~/.config/systemd/user/`), the way `systemctl edit` does, so package updates to the unit still apply. **Show Original** shows the packaged file, and **Revert to Vendor** deletes your overrides. If you switch to another service or close the window with unsaved edits, the app asks before discarding them.
-- **New service** (the + button) creates a `.service` unit from a form (command, type, restart policy, working directory, user, WantedBy). It can also enable and start the service right away.
+- **New service** (the + button) creates a `.service` unit from a form (command, type, restart policy, working directory, user, WantedBy). It can also enable and start the service right away. Turn on **Run on a schedule** to also create a matching `.timer` with an `OnCalendar=` schedule (checked with `systemd-analyze calendar`), for jobs that should run daily, hourly and so on.
+- **Timers** (the alarm button) lists the timers with the unit each one starts and its next and last run. Click one to jump to its service. A service's Status tab shows which timer starts it.
 - **Delete** removes a service you created (one whose unit file is in `/etc/systemd/system/` or `~/.config/systemd/user/`): it stops and disables it, deletes the unit file and its drop-ins, and reloads systemd. Vendor units can't be deleted.
 
 ## Requirements
@@ -63,7 +64,8 @@ Run the tests with `cargo test`.
 | systemd API | `src/systemd.rs` | Talks to `org.freedesktop.systemd1` over D-Bus with `zbus`, and listens for its change signals. Privileged calls set the *allow interactive authorization* flag so polkit can prompt. |
 | Journal | `src/journal.rs` | Runs `journalctl -f -u <unit>` (with `--user` for user services) and streams its output into the view. |
 | Main window | `src/window.rs` | Holds the list, the status, journal and unit file tabs, and the action buttons. D-Bus calls run on worker threads, so the UI never blocks. |
-| New service dialog | `src/new_service.rs` | Renders the form into a unit file, writes it, runs daemon-reload, then optionally enables and starts it. |
+| New service dialog | `src/new_service.rs` | Renders the form into a unit file (and a timer, when scheduled), writes it, runs daemon-reload, then optionally enables and starts it. |
+| Timers dialog | `src/timers.rs` | Lists timers with their next and last run. |
 
 Writing system unit files goes through `pkexec` (one call that creates the directory and writes the file) so polkit authorizes the write. User units are written directly to `~/.config/systemd/user/`.
 

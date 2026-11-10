@@ -1,6 +1,7 @@
 mod journal;
 mod new_service;
 mod systemd;
+mod timers;
 mod window;
 
 use adw::prelude::*;

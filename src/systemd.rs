@@ -156,6 +156,8 @@ pub struct Details {
     /// and its exit status or signal number.
     pub exec_main_code: i32,
     pub exec_main_status: i32,
+    /// Units that start this one, e.g. a timer.
+    pub triggered_by: Vec<String>,
 }
 
 /// A plain description of a service's Result property.
@@ -454,7 +456,73 @@ pub fn details(bus: Bus, name: &str) -> Res<Details> {
         result: svc.get_property::<String>("Result").unwrap_or_default(),
         exec_main_code: svc.get_property::<i32>("ExecMainCode").unwrap_or(0),
         exec_main_status: svc.get_property::<i32>("ExecMainStatus").unwrap_or(0),
+        triggered_by: unit
+            .get_property::<Vec<String>>("TriggeredBy")
+            .unwrap_or_default(),
     })
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Timer {
+    pub name: String,
+    pub description: String,
+    pub active_state: String,
+    /// The unit the timer starts.
+    pub unit: String,
+    /// Next elapse, in µs since the epoch (calendar timers), 0 if none.
+    pub next_realtime: u64,
+    /// Next elapse, in µs of CLOCK_MONOTONIC (OnBootSec= and similar timers), 0 if none.
+    pub next_monotonic: u64,
+    /// Last time the timer fired, in µs since the epoch, 0 if never.
+    pub last_trigger: u64,
+}
+
+/// All loaded timers, sorted by name.
+pub fn list_timers(bus: Bus) -> Res<Vec<Timer>> {
+    let conn = bus.connection()?;
+    let m = manager(bus)?;
+    let no_states: Vec<String> = Vec::new();
+    let units: Vec<UnitRow> = m
+        .call("ListUnitsByPatterns", &(no_states, vec!["*.timer"]))
+        .map_err(err)?;
+    let mut timers = Vec::new();
+    for u in units {
+        let t = proxy(&conn, u.6.as_str(), "org.freedesktop.systemd1.Timer")?;
+        // u64::MAX means "never" for these properties.
+        let time = |p: &str| {
+            t.get_property::<u64>(p)
+                .ok()
+                .filter(|v| *v != u64::MAX)
+                .unwrap_or(0)
+        };
+        timers.push(Timer {
+            unit: t.get_property::<String>("Unit").unwrap_or_default(),
+            next_realtime: time("NextElapseUSecRealtime"),
+            next_monotonic: time("NextElapseUSecMonotonic"),
+            last_trigger: time("LastTriggerUSec"),
+            name: u.0,
+            description: u.1,
+            active_state: u.3,
+        });
+    }
+    timers.sort_by_key(|t| t.name.to_lowercase());
+    Ok(timers)
+}
+
+/// Checks an OnCalendar= expression with `systemd-analyze calendar`, when available.
+pub fn check_calendar(expr: &str) -> Res<()> {
+    match Command::new("systemd-analyze")
+        .args(["calendar", "--", expr])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(out) if !out.status.success() => Err(format!(
+            "\"{expr}\" is not a valid schedule: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        // Fine, or systemd-analyze isn't installed: let systemd judge it later.
+        _ => Ok(()),
+    }
 }
 
 pub fn daemon_reload(bus: Bus) -> Res<()> {
@@ -677,12 +745,24 @@ pub fn is_deletable(bus: Bus, name: &str, fragment: &str) -> bool {
             .any(|p| p == Path::new(fragment))
 }
 
-/// Files that make up a locally created unit: its file and its drop-in directory.
+/// The timer with the same name as a locally created service (`foo.timer` for
+/// `foo.service`), if there is one in the admin directory.
+pub fn local_timer(bus: Bus, name: &str) -> Option<String> {
+    let timer = format!("{}.timer", name.strip_suffix(".service")?);
+    bus.unit_dir().join(&timer).exists().then_some(timer)
+}
+
+/// Files that make up a locally created unit: its file, its drop-in directory, and
+/// its timer.
 pub fn unit_files(bus: Bus, name: &str, fragment: &str) -> Vec<PathBuf> {
     let mut files = vec![PathBuf::from(fragment)];
-    let drop_ins = bus.unit_dir().join(format!("{name}.d"));
+    let dir = bus.unit_dir();
+    let drop_ins = dir.join(format!("{name}.d"));
     if drop_ins.exists() {
         files.push(drop_ins);
+    }
+    if let Some(timer) = local_timer(bus, name) {
+        files.push(dir.join(timer));
     }
     files
 }
@@ -693,11 +773,17 @@ pub fn delete_service(bus: Bus, name: &str, fragment: &str, running: bool) -> Re
     if !is_deletable(bus, name, fragment) {
         return Err(format!("{name} is not a locally created unit"));
     }
+    let m = manager(bus)?;
+    let timer = local_timer(bus, name);
+    if let Some(timer) = &timer {
+        // Stop the timer first, so it can't start the service again.
+        let _: Res<OwnedObjectPath> = call_auth(&m, "StopUnit", &(timer.as_str(), "replace"));
+    }
     if running {
         run_action(bus, name, Action::Stop)?;
     }
-    let m = manager(bus)?;
-    let names = vec![name.to_string()];
+    let mut names = vec![name.to_string()];
+    names.extend(timer);
     // Fails harmlessly for units that have no [Install] section.
     let _: Res<Vec<(String, String, String)>> = call_auth(&m, "DisableUnitFiles", &(&names, false));
     remove_files(bus, &unit_files(bus, name, fragment))?;
@@ -781,6 +867,7 @@ pub fn normalize_name(input: &str) -> Res<String> {
 }
 
 pub struct NewService {
+    pub name: String,
     pub description: String,
     pub exec_start: String,
     pub service_type: String,
@@ -788,6 +875,9 @@ pub struct NewService {
     pub working_dir: String,
     pub user: String,
     pub wanted_by: String,
+    /// OnCalendar= expression. When set, a timer starts the service on that schedule
+    /// and the service itself gets no [Install] section.
+    pub schedule: Option<String>,
 }
 
 pub fn render_unit(bus: Bus, s: &NewService) -> String {
@@ -808,10 +898,29 @@ pub fn render_unit(bus: Bus, s: &NewService) -> String {
         out += &format!("User={}\n", s.user);
     }
     out += &format!("Restart={}\n", s.restart);
-    if !s.wanted_by.is_empty() {
+    if !s.wanted_by.is_empty() && s.schedule.is_none() {
         out += &format!("\n[Install]\nWantedBy={}\n", s.wanted_by);
     }
     out
+}
+
+/// The timer unit that runs a new service on `s.schedule`.
+pub fn render_timer(s: &NewService) -> Option<String> {
+    let schedule = s.schedule.as_ref()?;
+    Some(format!(
+        "[Unit]\n\
+         Description=Run {} on a schedule\n\
+         \n\
+         [Timer]\n\
+         OnCalendar={schedule}\n\
+         # Run once at startup if the computer was off at the scheduled time.\n\
+         Persistent=true\n\
+         Unit={}\n\
+         \n\
+         [Install]\n\
+         WantedBy=timers.target\n",
+        s.name, s.name
+    ))
 }
 
 #[cfg(test)]
@@ -830,6 +939,7 @@ mod tests {
     #[test]
     fn renders_unit() {
         let spec = NewService {
+            name: "demo.service".into(),
             description: "Demo".into(),
             exec_start: "/usr/bin/demo --flag".into(),
             service_type: "simple".into(),
@@ -837,12 +947,24 @@ mod tests {
             working_dir: String::new(),
             user: "nobody".into(),
             wanted_by: "multi-user.target".into(),
+            schedule: None,
         };
         let system = render_unit(Bus::System, &spec);
         assert!(system.contains("ExecStart=/usr/bin/demo --flag\n"));
         assert!(system.contains("User=nobody\n"));
         assert!(system.ends_with("[Install]\nWantedBy=multi-user.target\n"));
         assert!(!render_unit(Bus::User, &spec).contains("User="));
+        assert!(render_timer(&spec).is_none());
+
+        let scheduled = NewService {
+            schedule: Some("daily".into()),
+            ..spec
+        };
+        assert!(!render_unit(Bus::System, &scheduled).contains("[Install]"));
+        let timer = render_timer(&scheduled).unwrap();
+        assert!(timer.contains("OnCalendar=daily\n"));
+        assert!(timer.contains("Unit=demo.service\n"));
+        assert!(timer.ends_with("WantedBy=timers.target\n"));
     }
 
     #[test]

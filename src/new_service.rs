@@ -53,6 +53,13 @@ pub fn show(win: &Rc<Window>) {
 
     let wanted_by = entry("Start with target (WantedBy)");
     wanted_by.set_text(bus.default_target());
+    let scheduled = adw::SwitchRow::builder()
+        .title("Run on a schedule")
+        .subtitle("Creates a timer that starts the service, instead of keeping it running")
+        .build();
+    let schedule = entry("When (OnCalendar), e.g. daily, Mon..Fri 09:00, *:0/15");
+    schedule.set_text("daily");
+    schedule.set_visible(false);
     let enable = adw::SwitchRow::builder()
         .title(if system {
             "Enable at boot"
@@ -80,9 +87,45 @@ pub fn show(win: &Rc<Window>) {
     service_group.add(&restart);
 
     let startup_group = adw::PreferencesGroup::builder().title("Startup").build();
+    startup_group.add(&scheduled);
+    startup_group.add(&schedule);
     startup_group.add(&wanted_by);
     startup_group.add(&enable);
     startup_group.add(&start);
+
+    // A scheduled job runs once and exits, so suggest oneshot without restarts, and
+    // let the timer (not a target) start it.
+    {
+        let (schedule, wanted_by, kind, restart, enable, start) = (
+            schedule.clone(),
+            wanted_by.clone(),
+            kind.clone(),
+            restart.clone(),
+            enable.clone(),
+            start.clone(),
+        );
+        let enable_title = enable.title();
+        scheduled.connect_active_notify(move |row| {
+            let on = row.is_active();
+            schedule.set_visible(on);
+            wanted_by.set_visible(!on);
+            if on {
+                enable.set_title(if system {
+                    "Enable the timer at boot"
+                } else {
+                    "Enable the timer at login"
+                });
+                start.set_title("Start the timer now");
+            } else {
+                enable.set_title(&enable_title);
+                start.set_title("Start now");
+            }
+            if on {
+                kind.set_selected(TYPES.iter().position(|t| *t == "oneshot").unwrap_or(0) as u32);
+                restart.set_selected(0);
+            }
+        });
+    }
 
     let page = adw::PreferencesPage::new();
     page.add(&service_group);
@@ -130,7 +173,24 @@ pub fn show(win: &Rc<Window>) {
         if path.exists() {
             return show_error(&format!("{} already exists", path.display()));
         }
+        let when = scheduled
+            .is_active()
+            .then(|| schedule.text().trim().to_string());
+        let timer_name = format!("{}.timer", unit_name.trim_end_matches(".service"));
+        let timer_path = bus.unit_dir().join(&timer_name);
+        if let Some(when) = &when {
+            if when.is_empty() {
+                return show_error("Enter when the service should run");
+            }
+            if let Err(e) = systemd::check_calendar(when) {
+                return show_error(&e);
+            }
+            if timer_path.exists() {
+                return show_error(&format!("{} already exists", timer_path.display()));
+            }
+        }
         let spec = NewService {
+            name: unit_name.clone(),
             description: description.text().trim().to_string(),
             exec_start,
             service_type: TYPES[kind.selected() as usize].to_string(),
@@ -138,9 +198,11 @@ pub fn show(win: &Rc<Window>) {
             working_dir: workdir.text().trim().to_string(),
             user: user.text().trim().to_string(),
             wanted_by: wanted_by.text().trim().to_string(),
+            schedule: when,
         };
         let content = systemd::render_unit(bus, &spec);
-        let do_enable = enable.is_active() && !spec.wanted_by.is_empty();
+        let timer = systemd::render_timer(&spec);
+        let do_enable = enable.is_active() && (timer.is_some() || !spec.wanted_by.is_empty());
         let do_start = start.is_active();
 
         btn.set_sensitive(false);
@@ -152,15 +214,24 @@ pub fn show(win: &Rc<Window>) {
         background(
             move || -> systemd::Res<Vec<String>> {
                 systemd::write_unit_file(bus, &path, &content)?;
+                if let Some(timer) = &timer {
+                    systemd::write_unit_file(bus, &timer_path, timer)?;
+                }
                 systemd::daemon_reload(bus)?;
+                // With a schedule, the timer is what gets enabled and started.
+                let target = if timer.is_some() {
+                    timer_name.as_str()
+                } else {
+                    unit_name.as_str()
+                };
                 let mut warnings = Vec::new();
                 if do_enable {
-                    if let Err(e) = systemd::run_action(bus, &unit_name, Action::Enable) {
+                    if let Err(e) = systemd::run_action(bus, target, Action::Enable) {
                         warnings.push(format!("enable failed: {e}"));
                     }
                 }
                 if do_start {
-                    if let Err(e) = systemd::run_action(bus, &unit_name, Action::Start) {
+                    if let Err(e) = systemd::run_action(bus, target, Action::Start) {
                         warnings.push(format!("start failed: {e}"));
                     }
                 }
