@@ -11,6 +11,7 @@ use sourceview5::prelude::*;
 
 use crate::journal::{self, JournalStream};
 use crate::new_service;
+use crate::resources::{self, ResourcesView};
 use crate::systemd::{self, Action, Bus, Details, EditTarget, Res, Service};
 use crate::timers;
 
@@ -42,7 +43,7 @@ const SHORTCUTS_UI: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child><object class="GtkShortcutsShortcut"><property name="title">Restart</property><property name="accelerator">&lt;Ctrl&gt;r</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Save unit file and reload</property><property name="accelerator">&lt;Ctrl&gt;s</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Pause or resume the journal</property><property name="accelerator">&lt;Ctrl&gt;p</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="title">Status, Journal and Unit File tabs</property><property name="accelerator">&lt;Alt&gt;1 &lt;Alt&gt;2 &lt;Alt&gt;3</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Status, Resources, Journal and Unit File tabs</property><property name="accelerator">&lt;Alt&gt;1 &lt;Alt&gt;2 &lt;Alt&gt;3 &lt;Alt&gt;4</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Next / previous match in the log</property><property name="accelerator">Return &lt;Shift&gt;Return</property></object></child>
           </object>
         </child>
@@ -130,6 +131,9 @@ pub struct Window {
     content_page: adw::NavigationPage,
     content_stack: gtk::Stack,
     view_stack: adw::ViewStack,
+    resources: Rc<ResourcesView>,
+    /// A usage sample is being fetched.
+    sampling: Cell<bool>,
     name_label: gtk::Label,
     description_label: gtk::Label,
     rows: StatusRows,
@@ -761,6 +765,13 @@ impl Window {
             "Status",
             "dialog-information-symbolic",
         );
+        let resources = ResourcesView::new();
+        view_stack.add_titled_with_icon(
+            &resources.widget,
+            Some("resources"),
+            "Resources",
+            "power-profile-performance-symbolic",
+        );
         view_stack.add_titled_with_icon(
             &journal_box,
             Some("journal"),
@@ -840,6 +851,8 @@ impl Window {
             content_page,
             content_stack,
             view_stack,
+            resources,
+            sampling: Cell::new(false),
             name_label,
             description_label,
             rows,
@@ -1124,13 +1137,61 @@ impl Window {
         w.add_shortcuts(app);
         w.refresh_list();
         w.watch_systemd();
+        let weak = Rc::downgrade(&w);
+        glib::timeout_add_seconds_local(resources::INTERVAL_SECS, move || match weak.upgrade() {
+            Some(w) => {
+                w.sample_usage();
+                glib::ControlFlow::Continue
+            }
+            None => glib::ControlFlow::Break,
+        });
         w
+    }
+
+    /// Every few seconds: samples the selected service's CPU, memory and tasks for the
+    /// Resources tab (with its processes when that tab is shown) and the Status tab.
+    fn sample_usage(self: &Rc<Self>) {
+        let Some(name) = self.selected.borrow().clone() else {
+            return;
+        };
+        if self.sampling.get() || !self.window.is_visible() {
+            return;
+        }
+        let tab = self.view_stack.visible_child_name();
+        let with_processes = tab.as_deref() == Some("resources");
+        self.sampling.set(true);
+        let bus = self.bus.get();
+        let weak = Rc::downgrade(self);
+        background(
+            move || systemd::usage(bus, &name, with_processes).map(|u| (name, u)),
+            move |res| {
+                let Some(w) = weak.upgrade() else { return };
+                w.sampling.set(false);
+                let Ok((name, u)) = res else { return };
+                if w.bus.get() != bus || w.selected.borrow().as_deref() != Some(name.as_str()) {
+                    return;
+                }
+                w.resources.push(&name, &u, std::time::Instant::now());
+                let dash = || "—".to_string();
+                w.rows.memory.set_subtitle(
+                    &u.memory
+                        .map(|m| glib::format_size(m).to_string())
+                        .unwrap_or_else(dash),
+                );
+                w.rows
+                    .cpu
+                    .set_subtitle(&u.cpu_nsec.map(systemd::format_cpu).unwrap_or_else(dash));
+                w.rows
+                    .tasks
+                    .set_subtitle(&u.tasks.map(|t| t.to_string()).unwrap_or_else(dash));
+            },
+        );
     }
 
     /// Window actions with keyboard shortcuts, and the shortcuts window (Ctrl+?).
     fn add_shortcuts(self: &Rc<Self>, app: &adw::Application) {
         type Handler = fn(&Rc<Window>);
-        let actions: [(&str, &[&str], Handler); 16] = [
+        let actions: [(&str, &[&str], Handler); 17] = [
             ("new-service", &["<Ctrl>n"], |w| new_service::show(w)),
             ("timers", &["<Ctrl>t"], |w| timers::show(w)),
             ("find", &["<Ctrl>f"], |w| w.focus_search()),
@@ -1156,8 +1217,9 @@ impl Window {
                 w.journal_pause.set_active(!w.journal_pause.is_active())
             }),
             ("tab-status", &["<Alt>1"], |w| w.show_tab("status")),
-            ("tab-journal", &["<Alt>2"], |w| w.show_tab("journal")),
-            ("tab-unit", &["<Alt>3"], |w| w.show_tab("unit")),
+            ("tab-resources", &["<Alt>2"], |w| w.show_tab("resources")),
+            ("tab-journal", &["<Alt>3"], |w| w.show_tab("journal")),
+            ("tab-unit", &["<Alt>4"], |w| w.show_tab("unit")),
             ("system-bus", &["<Ctrl>1"], |w| {
                 w.system_btn.set_active(true)
             }),
@@ -1467,8 +1529,10 @@ impl Window {
         self.content_page.set_title(&name);
         self.name_label.set_label(&name);
         self.description_label.set_label("");
+        self.resources.clear(&name);
         self.load_details(true);
         self.restart_journal();
+        self.sample_usage();
     }
 
     fn load_details(self: &Rc<Self>, reload_file: bool) {
@@ -1669,6 +1733,7 @@ impl Window {
         self.selected.replace(None);
         self.details.replace(None);
         self.journal.replace(None);
+        self.resources.clear("");
         self.unit_dirty.set(false);
         self.content_stack.set_visible_child_name("empty");
         self.content_page.set_title("Service");

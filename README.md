@@ -11,6 +11,7 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 - Switches between **System** services and your own **User** services.
 - **Start, Stop, Restart, Reload, Enable, Disable, Mask, Unmask, Reset Failed**. On system services, the polkit password prompt appears when systemd needs it. Masking a system service, or stopping, restarting or disabling one the system depends on (SSH, networking, the display manager, D-Bus and the like), asks you to confirm first.
 - **Status** shows active/sub state, why the service last stopped or failed (its result and the main process's exit code or signal), unit file state, active since, main PID, memory, CPU time, tasks, automatic restarts, and the unit file path. **Reset Failed** clears a failed state and the restart counter.
+- **Resources** shows live graphs of the service's CPU (percent of one core) and memory over the last 3 minutes, its memory peak and limit, tasks, disk read and written, and its processes with the heaviest first. It samples every 2 seconds, from the counters systemd keeps for the service's cgroup and from `/proc`.
 - **Journal** streams the unit's log live, starting from the last 100 to 10,000 lines. **Pause** freezes the view and keeps new lines until you **Resume**. **Find in log** highlights every match; Enter and Shift+Enter (or the arrows) jump between them. **Filters** narrows the log by priority (warnings and errors, or errors only), to the current boot, or to a recent time range, and the save button writes the log to a file.
 - **Unit File** lets you view and edit the unit with syntax highlighting and line numbers, then **Save and Reload**, which writes the file and runs daemon-reload. Vendor units (e.g. under `/usr/lib/systemd`) are never modified in place. For those, the editor holds a drop-in override (`/etc/systemd/system/<unit>.d/override.conf`, or under `~/.config/systemd/user/`), the way `systemctl edit` does, so package updates to the unit still apply. **Show Original** shows the packaged file, and **Revert to Vendor** deletes your overrides. If you switch to another service or close the window with unsaved edits, the app asks before discarding them.
 - **New service** (the + button) creates a `.service` unit from a form (command, stop command, environment variables, type, restart policy and delay, working directory, user, WantedBy). It checks that the command exists and is executable, and turns a bare command name like `python3` into its full path. It can also enable and start the service right away. Turn on **Run on a schedule** to also create a matching `.timer` with an `OnCalendar=` schedule (checked with `systemd-analyze calendar`), for jobs that should run daily, hourly and so on.
@@ -29,7 +30,7 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 | Ctrl+Shift+S, Ctrl+Shift+X, Ctrl+R | Start, Stop, Restart the selected service |
 | Ctrl+S | Save the unit file and reload |
 | Ctrl+P | Pause or resume the journal |
-| Alt+1 / Alt+2 / Alt+3 | Status / Journal / Unit File tab |
+| Alt+1 / Alt+2 / Alt+3 / Alt+4 | Status / Resources / Journal / Unit File tab |
 | Ctrl+? | Show all shortcuts |
 
 ## Requirements
@@ -90,6 +91,7 @@ Run the tests with `cargo test`.
 | Main window | `src/window.rs` | Holds the list, the status, journal and unit file tabs, and the action buttons. The list is a `GtkListView` that creates rows only for what is on screen and updates changed services in place. D-Bus calls run on worker threads, so the UI never blocks. |
 | New service dialog | `src/new_service.rs` | Renders the form into a unit file (and a timer, when scheduled), writes it, runs daemon-reload, then optionally enables and starts it. |
 | Timers dialog | `src/timers.rs` | Lists timers with their next and last run. |
+| Resources tab | `src/resources.rs` | Samples the service's cgroup counters and processes every 2 s and draws the graphs. |
 
 Writing system unit files goes through `pkexec` (one call that creates the directory and writes the file) so polkit authorizes the write. User units are written directly to `~/.config/systemd/user/`.
 

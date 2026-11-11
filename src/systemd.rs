@@ -532,6 +532,90 @@ pub fn check_calendar(expr: &str) -> Res<()> {
     }
 }
 
+/// One process of a service, read from /proc.
+#[derive(Clone, Debug, Default)]
+pub struct Process {
+    pub pid: u32,
+    pub command: String,
+    /// CPU time used so far, in clock ticks (USER_HZ, which Linux fixes at 100 for /proc).
+    pub cpu_ticks: u64,
+    /// Resident memory in bytes.
+    pub rss: u64,
+}
+
+/// Resource usage of a service right now. `None` means systemd doesn't know (the
+/// accounting is off, or the service isn't running).
+#[derive(Clone, Debug, Default)]
+pub struct Usage {
+    pub cpu_nsec: Option<u64>,
+    pub memory: Option<u64>,
+    pub memory_peak: Option<u64>,
+    pub memory_max: Option<u64>,
+    pub tasks: Option<u64>,
+    pub io_read: Option<u64>,
+    pub io_write: Option<u64>,
+    pub processes: Vec<Process>,
+}
+
+/// Reads the counters systemd keeps for the service's cgroup and, with
+/// `with_processes`, its processes. Cheaper than [`details`], so it can run every
+/// few seconds.
+pub fn usage(bus: Bus, name: &str, with_processes: bool) -> Res<Usage> {
+    let conn = bus.connection()?;
+    let m = manager(bus)?;
+    let path: OwnedObjectPath = m.call("LoadUnit", &(name,)).map_err(err)?;
+    let svc = proxy(&conn, path.as_str(), "org.freedesktop.systemd1.Service")?;
+    let known = |p: &str| svc.get_property::<u64>(p).ok().filter(|v| *v != u64::MAX);
+    let mut usage = Usage {
+        cpu_nsec: known("CPUUsageNSec"),
+        memory: known("MemoryCurrent"),
+        memory_peak: known("MemoryPeak"),
+        memory_max: known("MemoryMax").filter(|v| *v > 0),
+        tasks: known("TasksCurrent"),
+        io_read: known("IOReadBytes"),
+        io_write: known("IOWriteBytes"),
+        processes: Vec::new(),
+    };
+    if with_processes {
+        // (cgroup, pid, command line); fails harmlessly for units that aren't running.
+        let procs: Vec<(String, u32, String)> =
+            m.call("GetUnitProcesses", &(name,)).unwrap_or_default();
+        usage.processes = procs
+            .into_iter()
+            .map(|(_, pid, command)| {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                let status =
+                    std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+                Process {
+                    pid,
+                    command,
+                    cpu_ticks: parse_proc_cpu_ticks(&stat).unwrap_or(0),
+                    rss: parse_vm_rss(&status).unwrap_or(0),
+                }
+            })
+            .collect();
+    }
+    Ok(usage)
+}
+
+/// utime + stime from /proc/<pid>/stat.
+pub fn parse_proc_cpu_ticks(stat: &str) -> Option<u64> {
+    // The command name (field 2) is in parentheses and may contain spaces.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // fields[0] is field 3 (state), so utime (14) and stime (15) are 11 and 12.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// VmRSS from /proc/<pid>/status, in bytes.
+pub fn parse_vm_rss(status: &str) -> Option<u64> {
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
 pub fn daemon_reload(bus: Bus) -> Res<()> {
     call_auth(&manager(bus)?, "Reload", &())
 }
@@ -1123,6 +1207,16 @@ mod tests {
         assert_eq!(format_cpu(7_500_000_000_000), "2 h 5 min");
         assert_eq!(describe_result("success"), "Success");
         assert!(describe_result("weird").contains("weird"));
+    }
+
+    #[test]
+    fn parses_proc_files() {
+        let stat = "1234 (my (odd) app) S 1 1234 1234 0 -1 4194560 500 0 0 0 250 50 0 0 20 0 3 0";
+        assert_eq!(parse_proc_cpu_ticks(stat), Some(300));
+        assert_eq!(parse_proc_cpu_ticks("garbage"), None);
+        let status = "Name:\tapp\nVmPeak:\t  2000 kB\nVmRSS:\t    1500 kB\n";
+        assert_eq!(parse_vm_rss(status), Some(1500 * 1024));
+        assert_eq!(parse_vm_rss("Name: x"), None);
     }
 
     #[test]
