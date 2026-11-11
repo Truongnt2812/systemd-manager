@@ -1393,7 +1393,7 @@ impl Window {
                 let dash = || "—".to_string();
                 w.rows.memory.set_subtitle(
                     &u.memory
-                        .map(|m| glib::format_size(m).to_string())
+                        .map(|m| resources::describe_memory(m, u.memory_anon, u.memory_file))
                         .unwrap_or_else(dash),
                 );
                 w.rows

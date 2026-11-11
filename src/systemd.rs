@@ -577,6 +577,11 @@ pub struct Usage {
     pub memory: Option<u64>,
     pub memory_peak: Option<u64>,
     pub memory_max: Option<u64>,
+    /// Part of `memory` that the processes themselves use (anonymous memory)...
+    pub memory_anon: Option<u64>,
+    /// ...and part that is the kernel's cache of files the service read or wrote,
+    /// which the kernel can drop when it needs the memory.
+    pub memory_file: Option<u64>,
     pub tasks: Option<u64>,
     pub io_read: Option<u64>,
     pub io_write: Option<u64>,
@@ -597,11 +602,25 @@ pub fn usage(bus: Bus, name: &str, with_processes: bool) -> Res<Usage> {
         memory: known("MemoryCurrent"),
         memory_peak: known("MemoryPeak"),
         memory_max: known("MemoryMax").filter(|v| *v > 0),
+        memory_anon: None,
+        memory_file: None,
         tasks: known("TasksCurrent"),
         io_read: known("IOReadBytes"),
         io_write: known("IOWriteBytes"),
         processes: Vec::new(),
     };
+    // ControlGroup lives on the Service interface, not on Unit.
+    if let Ok(cgroup) = svc.get_property::<String>("ControlGroup") {
+        if !cgroup.is_empty() {
+            // cgroup v2, then the v1 memory controller.
+            let stat = std::fs::read_to_string(format!("/sys/fs/cgroup{cgroup}/memory.stat"))
+                .or_else(|_| {
+                    std::fs::read_to_string(format!("/sys/fs/cgroup/memory{cgroup}/memory.stat"))
+                })
+                .unwrap_or_default();
+            (usage.memory_anon, usage.memory_file) = parse_memory_stat(&stat);
+        }
+    }
     if with_processes {
         // (cgroup, pid, command line); fails harmlessly for units that aren't running.
         let procs: Vec<(String, u32, String)> =
@@ -622,6 +641,21 @@ pub fn usage(bus: Bus, name: &str, with_processes: bool) -> Res<Usage> {
             .collect();
     }
     Ok(usage)
+}
+
+/// (anonymous, file cache) bytes from a cgroup's memory.stat (v2 names, or the
+/// hierarchical v1 ones).
+pub fn parse_memory_stat(stat: &str) -> (Option<u64>, Option<u64>) {
+    let get = |key: &str| {
+        stat.lines().find_map(|l| {
+            let (k, v) = l.split_once(' ')?;
+            (k == key).then(|| v.trim().parse::<u64>().ok()).flatten()
+        })
+    };
+    (
+        get("anon").or_else(|| get("total_rss")),
+        get("file").or_else(|| get("total_cache")),
+    )
 }
 
 /// utime + stime from /proc/<pid>/stat.
@@ -1243,6 +1277,15 @@ mod tests {
         let status = "Name:\tapp\nVmPeak:\t  2000 kB\nVmRSS:\t    1500 kB\n";
         assert_eq!(parse_vm_rss(status), Some(1500 * 1024));
         assert_eq!(parse_vm_rss("Name: x"), None);
+        assert_eq!(
+            parse_memory_stat("anon 241000000\nfile 330000000\nkernel 5\n"),
+            (Some(241_000_000), Some(330_000_000))
+        );
+        assert_eq!(
+            parse_memory_stat("cache 1\nrss 2\ntotal_cache 300\ntotal_rss 200\n"),
+            (Some(200), Some(300))
+        );
+        assert_eq!(parse_memory_stat(""), (None, None));
     }
 
     #[test]

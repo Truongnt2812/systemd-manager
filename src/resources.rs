@@ -20,6 +20,39 @@ const MAX_PROCESSES: usize = 50;
 /// /proc reports CPU time in USER_HZ ticks, which Linux fixes at 100 per second.
 const TICKS_PER_SEC: f64 = 100.0;
 
+/// Number of CPU threads, to turn "% of one core" into "% of all CPUs" (what most
+/// system monitors show).
+pub fn cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// "43.8 % of one core (0.9 % of all 48 CPUs)".
+pub fn describe_cpu(percent_of_core: f64, cpus: usize) -> String {
+    if cpus <= 1 {
+        return format!("{percent_of_core:.1} %");
+    }
+    format!(
+        "{percent_of_core:.1} % of one core ({:.1} % of all {cpus} CPUs)",
+        percent_of_core / cpus as f64
+    )
+}
+
+/// "561.5 MB (230.7 MB process memory, 330.8 MB file cache)".
+pub fn describe_memory(total: u64, anon: Option<u64>, file: Option<u64>) -> String {
+    let size = |b: u64| glib::format_size(b).to_string();
+    match (anon, file) {
+        (Some(a), Some(f)) => format!(
+            "{} ({} process memory, {} file cache)",
+            size(total),
+            size(a),
+            size(f)
+        ),
+        _ => size(total),
+    }
+}
+
 /// CPU use in percent of one core, from two readings of a CPU-time counter.
 pub fn cpu_percent(delta_cpu_nsec: u64, delta_wall_nsec: u64) -> f64 {
     if delta_wall_nsec == 0 {
@@ -191,10 +224,16 @@ impl ResourcesView {
 
         let cpu_group = adw::PreferencesGroup::builder()
             .title("CPU")
-            .description("Percent of one core, over the last 3 minutes")
+            .description(format!(
+                "Percent of one core, over the last 3 minutes. 100 % is one core fully busy; this computer has {} CPUs",
+                cpu_count()
+            ))
             .build();
         cpu_group.add(&graph_card(&cpu_graph, &cpu_label));
-        let memory_group = adw::PreferencesGroup::builder().title("Memory").build();
+        let memory_group = adw::PreferencesGroup::builder()
+            .title("Memory")
+            .description("Everything systemd counts for the service: its processes' memory plus the kernel's cache of files it used, which is freed when needed")
+            .build();
         memory_group.add(&graph_card(&memory_graph, &memory_label));
 
         let tasks = value_row("Tasks");
@@ -364,7 +403,8 @@ impl ResourcesView {
 
         self.cpu_label.set_label(&match (cpu, u.cpu_nsec) {
             (Some(c), Some(total)) => format!(
-                "{c:.1} % now · {:.1} % average · {} in total",
+                "{} now · {:.1} % average · {} in total",
+                describe_cpu(c, cpu_count()),
                 cpu_avg.unwrap_or(c),
                 systemd::format_cpu(total)
             ),
@@ -373,7 +413,7 @@ impl ResourcesView {
         });
         self.memory_label.set_label(&match u.memory {
             Some(m) => {
-                let mut s = format!("{} now", size(m as f64));
+                let mut s = format!("{} now", describe_memory(m, u.memory_anon, u.memory_file));
                 if let Some(p) = u.memory_peak {
                     s += &format!(" · peak {}", size(p as f64));
                 }
@@ -400,7 +440,7 @@ impl ResourcesView {
                 .title(&p.command)
                 .title_lines(1)
                 .subtitle(format!(
-                    "PID {} · {:.1} % CPU · {}",
+                    "PID {} · {:.1} % of a core · {}",
                     p.pid,
                     p.cpu,
                     size(p.rss as f64)
@@ -424,6 +464,17 @@ mod tests {
         assert_eq!(cpu_percent(1_000_000_000, 2_000_000_000), 50.0);
         assert_eq!(cpu_percent(4_000_000_000, 2_000_000_000), 200.0);
         assert_eq!(cpu_percent(5, 0), 0.0);
+    }
+
+    #[test]
+    fn describes_cpu_and_memory() {
+        assert_eq!(
+            describe_cpu(43.8, 48),
+            "43.8 % of one core (0.9 % of all 48 CPUs)"
+        );
+        assert_eq!(describe_cpu(5.0, 1), "5.0 %");
+        assert!(describe_memory(100, Some(40), Some(60)).contains("process memory"));
+        assert!(!describe_memory(100, None, None).contains("cache"));
     }
 
     #[test]
