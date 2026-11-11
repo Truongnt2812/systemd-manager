@@ -1,6 +1,7 @@
 //! The main window: a service list on the left, status / journal / unit file on the right.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -52,6 +53,63 @@ const SHORTCUTS_UI: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   </object>
 </interface>
 "#;
+
+const SORTS: [&str; 3] = ["Name", "CPU", "Memory"];
+const SORT_NAME: u32 = 0;
+const SORT_CPU: u32 = 1;
+const SORT_MEMORY: u32 = 2;
+
+/// What the list shows and sorts by when it is sorted by CPU or memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RowUsage {
+    /// Percent of one core since the previous sample.
+    cpu: Option<f64>,
+    memory: Option<u64>,
+}
+
+/// State shared by the list's row factory and sorter.
+#[derive(Clone, Default)]
+struct ListContext {
+    sort: Rc<Cell<u32>>,
+    usage: Rc<RefCell<HashMap<String, RowUsage>>>,
+    /// The state label of each row on screen, so usage can be shown without a rebind.
+    labels: Rc<RefCell<HashMap<String, glib::WeakRef<gtk::Label>>>>,
+}
+
+/// The right-hand label of a row: the state, or CPU / memory when sorted by those.
+fn row_label(sort: u32, s: &Service, usage: Option<&RowUsage>) -> String {
+    let u = usage.copied().unwrap_or_default();
+    match sort {
+        SORT_CPU if u.cpu.is_some() => format!("{:.1} %", u.cpu.unwrap_or(0.0)),
+        SORT_MEMORY if u.memory.is_some() => glib::format_size(u.memory.unwrap_or(0)).to_string(),
+        _ => s.active_state.clone(),
+    }
+}
+
+/// Order of the list: by name, or heaviest first (services without a value last,
+/// then by name).
+fn compare_services(
+    sort: u32,
+    a: &Service,
+    b: &Service,
+    usage: &HashMap<String, RowUsage>,
+) -> std::cmp::Ordering {
+    let value = |s: &Service| {
+        let u = usage.get(&s.name).copied().unwrap_or_default();
+        match sort {
+            SORT_CPU => u.cpu,
+            SORT_MEMORY => u.memory.map(|m| m as f64),
+            _ => None,
+        }
+    };
+    let by_value = match (value(a), value(b)) {
+        (Some(x), Some(y)) => y.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    };
+    by_value.then_with(|| a.sort_key().cmp(&b.sort_key()))
+}
 
 const FILTERS: [&str; 5] = ["All", "Running", "Failed", "Inactive", "Enabled"];
 const JOURNAL_LINES: [u32; 4] = [100, 500, 2000, 10000];
@@ -124,6 +182,14 @@ pub struct Window {
     /// Every service of the current bus, as `BoxedAnyObject`s holding a `Service`.
     store: gio::ListStore,
     list_filter: gtk::CustomFilter,
+    sort: gtk::DropDown,
+    sorter: gtk::CustomSorter,
+    list_ctx: ListContext,
+    /// Previous CPU counters (ns) of the listed services, for CPU %.
+    list_cpu_prev: RefCell<(HashMap<String, u64>, Option<std::time::Instant>)>,
+    list_sampling: Cell<bool>,
+    /// Show the top of the list after the next re-sort (the sort was just changed).
+    scroll_to_top: Cell<bool>,
     selection: gtk::SingleSelection,
     search: gtk::SearchEntry,
     filter: gtk::DropDown,
@@ -311,7 +377,10 @@ fn merge_services(store: &gio::ListStore, services: &[Service]) {
 
 /// Builds the widgets of a service row once; `bind_service_row` fills them in.
 /// A click on a row also opens its details when the window is narrow.
-fn service_row_factory(split: &adw::NavigationSplitView) -> gtk::SignalListItemFactory {
+fn service_row_factory(
+    split: &adw::NavigationSplitView,
+    ctx: &ListContext,
+) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     let split = split.downgrade();
     factory.connect_setup(move |_, item| {
@@ -355,7 +424,8 @@ fn service_row_factory(split: &adw::NavigationSplitView) -> gtk::SignalListItemF
         hbox.add_controller(click);
         item.set_child(Some(&hbox));
     });
-    factory.connect_bind(|_, item| {
+    let bind_ctx = ctx.clone();
+    factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
         };
@@ -373,19 +443,42 @@ fn service_row_factory(split: &adw::NavigationSplitView) -> gtk::SignalListItemF
         for (widget, label) in [
             (name, s.name.clone()),
             (desc, service_subtitle(&s)),
-            (state.clone(), s.active_state.clone()),
+            (
+                state.clone(),
+                row_label(
+                    bind_ctx.sort.get(),
+                    &s,
+                    bind_ctx.usage.borrow().get(&s.name),
+                ),
+            ),
         ] {
             if let Some(l) = widget.and_downcast::<gtk::Label>() {
                 l.set_label(&label);
             }
         }
-        if let Some(state) = state {
+        if let Some(state) = state.and_downcast::<gtk::Label>() {
             state.set_css_classes(&["caption", state_class(&s.active_state)]);
+            bind_ctx
+                .labels
+                .borrow_mut()
+                .insert(s.name.clone(), state.downgrade());
         }
         hbox.set_tooltip_text(Some(&format!(
             "{} — {} ({})",
             s.name, s.active_state, s.sub_state
         )));
+    });
+    let unbind_ctx = ctx.clone();
+    factory.connect_unbind(move |_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        if let Some(obj) = item.item().and_downcast::<glib::BoxedAnyObject>() {
+            unbind_ctx
+                .labels
+                .borrow_mut()
+                .remove(&obj.borrow::<Service>().name);
+        }
     });
     factory
 }
@@ -445,16 +538,35 @@ impl Window {
             .margin_top(6)
             .margin_bottom(6)
             .build();
+        let sort = gtk::DropDown::from_strings(&SORTS);
+        sort.set_tooltip_text(Some(
+            "Sort by name, or by CPU or memory use (heaviest first)",
+        ));
         filter_box.append(&search);
         filter_box.append(&filter);
+        filter_box.append(&sort);
 
         // Rows are created only for visible services and only changed ones are replaced, so a
         // refresh doesn't rebuild hundreds of widgets or lose the scroll position.
         let store = gio::ListStore::new::<glib::BoxedAnyObject>();
         let list_filter = gtk::CustomFilter::new(|_| true);
         let filtered = gtk::FilterListModel::new(Some(store.clone()), Some(list_filter.clone()));
+        let list_ctx = ListContext::default();
+        let sorter = {
+            let ctx = list_ctx.clone();
+            gtk::CustomSorter::new(move |a, b| {
+                let get = |o: &glib::Object| o.downcast_ref::<glib::BoxedAnyObject>().cloned();
+                let (Some(a), Some(b)) = (get(a), get(b)) else {
+                    return gtk::Ordering::Equal;
+                };
+                let (a, b) = (a.borrow::<Service>(), b.borrow::<Service>());
+                let order = compare_services(ctx.sort.get(), &a, &b, &ctx.usage.borrow());
+                order.into()
+            })
+        };
+        let sorted = gtk::SortListModel::new(Some(filtered), Some(sorter.clone()));
         let selection = gtk::SingleSelection::builder()
-            .model(&filtered)
+            .model(&sorted)
             .autoselect(false)
             .can_unselect(true)
             .build();
@@ -811,7 +923,7 @@ impl Window {
         split.set_min_sidebar_width(300.0);
         split.set_sidebar_width_fraction(0.3);
         split.set_max_sidebar_width(420.0);
-        list.set_factory(Some(&service_row_factory(&split)));
+        list.set_factory(Some(&service_row_factory(&split, &list_ctx)));
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&split));
 
@@ -839,6 +951,12 @@ impl Window {
             list,
             store,
             list_filter,
+            sort,
+            sorter,
+            list_ctx,
+            list_cpu_prev: RefCell::new((HashMap::new(), None)),
+            list_sampling: Cell::new(false),
+            scroll_to_top: Cell::new(false),
             selection,
             search,
             filter,
@@ -930,6 +1048,20 @@ impl Window {
             if let Some(w) = weak.upgrade() {
                 w.refilter();
             }
+        });
+        let weak = Rc::downgrade(&w);
+        w.sort.connect_selected_notify(move |dropdown| {
+            let Some(w) = weak.upgrade() else { return };
+            w.list_ctx.sort.set(dropdown.selected());
+            w.list_ctx.usage.borrow_mut().clear();
+            *w.list_cpu_prev.borrow_mut() = (HashMap::new(), None);
+            w.resort();
+            w.scroll_to_top.set(true);
+            if w.selection.n_items() > 0 {
+                w.list.scroll_to(0, gtk::ListScrollFlags::NONE, None);
+            }
+            // The first sample gives memory; CPU needs a second one.
+            w.sample_list_usage();
         });
         let weak = Rc::downgrade(&w);
         w.filter.connect_selected_notify(move |_| {
@@ -1129,11 +1261,109 @@ impl Window {
         glib::timeout_add_seconds_local(resources::INTERVAL_SECS, move || match weak.upgrade() {
             Some(w) => {
                 w.sample_usage();
+                w.sample_list_usage();
                 glib::ControlFlow::Continue
             }
             None => glib::ControlFlow::Break,
         });
         w
+    }
+
+    /// Sorting by CPU or memory: every few seconds, reads the counters of the running
+    /// services, re-sorts the list and shows the values in the rows.
+    fn sample_list_usage(self: &Rc<Self>) {
+        if self.list_ctx.sort.get() == SORT_NAME
+            || self.list_sampling.get()
+            || !self.window.is_visible()
+        {
+            return;
+        }
+        let units: Vec<(String, String)> = self
+            .services
+            .borrow()
+            .iter()
+            .filter(|s| {
+                !s.object_path.is_empty()
+                    && matches!(
+                        s.active_state.as_str(),
+                        "active" | "reloading" | "activating" | "deactivating"
+                    )
+            })
+            .map(|s| (s.name.clone(), s.object_path.clone()))
+            .collect();
+        self.list_sampling.set(true);
+        let bus = self.bus.get();
+        let weak = Rc::downgrade(self);
+        background(
+            move || systemd::bulk_usage(bus, &units),
+            move |res| {
+                let Some(w) = weak.upgrade() else { return };
+                w.list_sampling.set(false);
+                let Ok(counters) = res else { return };
+                if w.bus.get() != bus || w.list_ctx.sort.get() == SORT_NAME {
+                    return;
+                }
+                let now = std::time::Instant::now();
+                let mut prev = w.list_cpu_prev.borrow_mut();
+                let elapsed = prev.1.map(|t| now.duration_since(t).as_nanos() as u64);
+                let usage: HashMap<String, RowUsage> = counters
+                    .iter()
+                    .map(|(name, (cpu, memory))| {
+                        let cpu = match (cpu, prev.0.get(name), elapsed) {
+                            (Some(c), Some(p), Some(e)) if c >= p => {
+                                Some(resources::cpu_percent(c - p, e))
+                            }
+                            _ => None,
+                        };
+                        (
+                            name.clone(),
+                            RowUsage {
+                                cpu,
+                                memory: *memory,
+                            },
+                        )
+                    })
+                    .collect();
+                *prev = (
+                    counters
+                        .iter()
+                        .filter_map(|(n, (c, _))| c.map(|c| (n.clone(), c)))
+                        .collect(),
+                    Some(now),
+                );
+                drop(prev);
+                // CPU % needs two samples, so the first one may not change the order yet.
+                let sorted_now = usage.values().any(|u| match w.list_ctx.sort.get() {
+                    SORT_CPU => u.cpu.is_some(),
+                    _ => u.memory.is_some(),
+                });
+                *w.list_ctx.usage.borrow_mut() = usage;
+                w.resort();
+                if sorted_now && w.scroll_to_top.replace(false) && w.selection.n_items() > 0 {
+                    w.list.scroll_to(0, gtk::ListScrollFlags::NONE, None);
+                }
+            },
+        );
+    }
+
+    /// Sorts the list again and refreshes the values shown in the rows.
+    fn resort(&self) {
+        self.rebuilding.set(true);
+        self.sorter.changed(gtk::SorterChange::Different);
+        self.rebuilding.set(false);
+        let sort = self.list_ctx.sort.get();
+        let usage = self.list_ctx.usage.borrow();
+        let services = self.services.borrow();
+        for (name, label) in self.list_ctx.labels.borrow().iter() {
+            let (Some(label), Some(s)) =
+                (label.upgrade(), services.iter().find(|s| &s.name == name))
+            else {
+                continue;
+            };
+            label.set_label(&row_label(sort, s, usage.get(name)));
+        }
+        drop((usage, services));
+        self.reselect_current();
     }
 
     /// Every few seconds: samples the selected service's CPU, memory and tasks for the
@@ -2264,5 +2494,52 @@ mod tests {
 
         merge_services(&store, &[]);
         assert_eq!(store.n_items(), 0);
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    #[test]
+    fn sorts_heaviest_first() {
+        let svc = |n: &str| Service {
+            name: n.into(),
+            active_state: "active".into(),
+            ..Default::default()
+        };
+        let mut usage = HashMap::new();
+        usage.insert(
+            "a".into(),
+            RowUsage {
+                cpu: Some(1.0),
+                memory: Some(300),
+            },
+        );
+        usage.insert(
+            "b".into(),
+            RowUsage {
+                cpu: Some(9.0),
+                memory: Some(100),
+            },
+        );
+        let mut list = [svc("c"), svc("a"), svc("b")];
+        list.sort_by(|x, y| compare_services(SORT_CPU, x, y, &usage));
+        assert_eq!(
+            list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["b", "a", "c"]
+        );
+        list.sort_by(|x, y| compare_services(SORT_MEMORY, x, y, &usage));
+        assert_eq!(
+            list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        list.sort_by(|x, y| compare_services(SORT_NAME, x, y, &usage));
+        assert_eq!(
+            list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(row_label(SORT_CPU, &svc("b"), usage.get("b")), "9.0 %");
+        assert_eq!(row_label(SORT_CPU, &svc("c"), usage.get("c")), "active");
     }
 }

@@ -128,6 +128,8 @@ pub struct Service {
     pub sub_state: String,
     /// enabled / disabled / static / masked / ... (empty for transient units)
     pub file_state: String,
+    /// D-Bus object of a loaded unit (empty when it isn't loaded).
+    pub object_path: String,
 }
 
 impl Service {
@@ -405,6 +407,7 @@ pub fn list_services(bus: Bus) -> Res<Vec<Service>> {
                 active_state: u.3,
                 sub_state: u.4,
                 file_state: String::new(),
+                object_path: u.6.to_string(),
             },
         );
     }
@@ -530,6 +533,29 @@ pub fn check_calendar(expr: &str) -> Res<()> {
         // Fine, or systemd-analyze isn't installed: let systemd judge it later.
         _ => Ok(()),
     }
+}
+
+/// CPU time in ns and memory in bytes, when systemd knows them.
+pub type UnitCounters = (Option<u64>, Option<u64>);
+
+/// CPU time (ns) and memory (bytes) of many units at once, keyed by unit name, for
+/// sorting the list. Takes (name, object path) pairs of loaded units; units whose
+/// counters systemd doesn't know are left out.
+pub fn bulk_usage(bus: Bus, units: &[(String, String)]) -> Res<HashMap<String, UnitCounters>> {
+    let conn = bus.connection()?;
+    let mut out = HashMap::new();
+    for (name, path) in units {
+        let Ok(svc) = proxy(&conn, path.as_str(), "org.freedesktop.systemd1.Service") else {
+            continue;
+        };
+        let known = |p: &str| svc.get_property::<u64>(p).ok().filter(|v| *v != u64::MAX);
+        let cpu = known("CPUUsageNSec");
+        let memory = known("MemoryCurrent");
+        if cpu.is_some() || memory.is_some() {
+            out.insert(name.clone(), (cpu, memory));
+        }
+    }
+    Ok(out)
 }
 
 /// One process of a service, read from /proc.

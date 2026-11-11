@@ -6,7 +6,7 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 
 ## Features
 
-- Lists every service: the ones systemd has loaded plus installed unit files that aren't loaded yet. You can search and filter the list (All, Running, Failed, Inactive, Enabled).
+- Lists every service: the ones systemd has loaded plus installed unit files that aren't loaded yet. You can search and filter the list (All, Running, Failed, Inactive, Enabled). You can also sort it by **CPU** or **Memory**, heaviest first: the rows then show each running service's CPU % (of one core) or memory, updated every 2 seconds.
 - Updates by itself when services change outside the app (systemctl, crashes, package updates), using systemd's change signals. If the bus connection drops (for example when D-Bus or the user manager restarts), the app reconnects by itself and catches up.
 - Switches between **System** services and your own **User** services.
 - **Start, Stop, Restart, Reload, Enable, Disable, Mask, Unmask, Reset Failed**. On system services, the polkit password prompt appears when systemd needs it. Masking a system service, or stopping, restarting or disabling one the system depends on (SSH, networking, the display manager, D-Bus and the like), asks you to confirm first.
