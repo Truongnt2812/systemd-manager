@@ -1,5 +1,6 @@
 mod journal;
 mod new_service;
+mod preferences;
 mod resources;
 mod systemd;
 mod timers;
@@ -15,7 +16,10 @@ fn main() -> glib::ExitCode {
     // taskbars can find our icon (Wayland already uses the application id).
     glib::set_prgname(Some(APP_ID));
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| gtk::Window::set_default_icon_name(APP_ID));
+    app.connect_startup(|_| {
+        gtk::Window::set_default_icon_name(APP_ID);
+        preferences::apply(&preferences::Settings::load());
+    });
     app.connect_activate(|app| {
         if let Some(win) = app.active_window() {
             win.present();

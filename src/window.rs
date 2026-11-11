@@ -32,6 +32,7 @@ const SHORTCUTS_UI: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child><object class="GtkShortcutsShortcut"><property name="title">Reload (the list updates by itself)</property><property name="accelerator">F5</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">System services</property><property name="accelerator">&lt;Ctrl&gt;1</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">User services</property><property name="accelerator">&lt;Ctrl&gt;2</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Preferences</property><property name="accelerator">&lt;Ctrl&gt;comma</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Keyboard shortcuts</property><property name="accelerator">&lt;Ctrl&gt;question</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Close window</property><property name="accelerator">&lt;Ctrl&gt;w</property></object></child>
           </object>
@@ -314,6 +315,7 @@ fn unit_file_view(editable: bool) -> sourceview5::View {
         .buffer(&buffer)
         .editable(editable)
         .monospace(true)
+        .css_classes([crate::preferences::MONO_CLASS])
         .show_line_numbers(true)
         .highlight_current_line(editable)
         .tab_width(4)
@@ -513,6 +515,7 @@ impl Window {
         side_header.set_title_widget(Some(&bus_box));
         side_header.pack_start(&timers_btn);
         let main_menu = gio::Menu::new();
+        main_menu.append(Some("_Preferences"), Some("win.preferences"));
         main_menu.append(Some("_Keyboard Shortcuts"), Some("win.show-help-overlay"));
         main_menu.append(Some("_About Systemd Manager"), Some("win.about"));
         let menu_btn = gtk::MenuButton::builder()
@@ -703,6 +706,7 @@ impl Window {
             .editable(false)
             .cursor_visible(false)
             .monospace(true)
+            .css_classes([crate::preferences::MONO_CLASS])
             .wrap_mode(gtk::WrapMode::WordChar)
             .top_margin(8)
             .bottom_margin(8)
@@ -1409,7 +1413,7 @@ impl Window {
     /// Window actions with keyboard shortcuts, and the shortcuts window (Ctrl+?).
     fn add_shortcuts(self: &Rc<Self>, app: &adw::Application) {
         type Handler = fn(&Rc<Window>);
-        let actions: [(&str, &[&str], Handler); 17] = [
+        let actions: [(&str, &[&str], Handler); 18] = [
             ("new-service", &["<Ctrl>n"], |w| new_service::show(w)),
             ("timers", &["<Ctrl>t"], |w| timers::show(w)),
             ("find", &["<Ctrl>f"], |w| w.focus_search()),
@@ -1443,6 +1447,9 @@ impl Window {
             }),
             ("user-bus", &["<Ctrl>2"], |w| w.user_btn.set_active(true)),
             ("close", &["<Ctrl>w"], |w| w.window.close()),
+            ("preferences", &["<Ctrl>comma"], |w| {
+                crate::preferences::show(&w.window)
+            }),
             ("about", &[], |w| w.show_about()),
         ];
         for (name, accels, handler) in actions {

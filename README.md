@@ -17,6 +17,7 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 - **New service** (the + button) creates a `.service` unit from a form (command, stop command, environment variables, type, restart policy and delay, working directory, user, WantedBy). It checks that the command exists and is executable, and turns a bare command name like `python3` into its full path. It can also enable and start the service right away. Turn on **Run on a schedule** to also create a matching `.timer` with an `OnCalendar=` schedule (checked with `systemd-analyze calendar`), for jobs that should run daily, hourly and so on.
 - **Timers** (the alarm button) lists the timers with the unit each one starts and its next and last run. Click one to jump to its service. A service's Status tab shows which timer starts it.
 - **Delete** removes a service you created (one whose unit file is in `/etc/systemd/system/` or `~/.config/systemd/user/`): it stops and disables it, deletes the unit file and its drop-ins, and reloads systemd. Vendor units can't be deleted.
+- **Preferences** (main menu, or Ctrl+,) sets the style (follow the system, light or dark), the interface font, and the monospace font used for unit files and the journal. Settings are saved in `~/.config/systemd-manager/settings.ini`.
 
 ### Keyboard shortcuts
 
@@ -31,6 +32,7 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 | Ctrl+S | Save the unit file and reload |
 | Ctrl+P | Pause or resume the journal |
 | Alt+1 / Alt+2 / Alt+3 / Alt+4 | Status / Resources / Journal / Unit File tab |
+| Ctrl+, | Preferences |
 | Ctrl+? | Show all shortcuts |
 
 ## Requirements
