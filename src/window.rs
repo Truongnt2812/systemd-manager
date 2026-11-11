@@ -2349,10 +2349,7 @@ impl Window {
                     return;
                 }
                 background(
-                    move || -> Res<()> {
-                        systemd::remove_files(bus, &files)?;
-                        systemd::daemon_reload(bus)
-                    },
+                    move || -> Res<()> { systemd::remove_files_and_reload(bus, &files) },
                     move |res| {
                         let Some(w) = weak.upgrade() else { return };
                         match res {
@@ -2391,8 +2388,7 @@ impl Window {
         let weak = Rc::downgrade(self);
         background(
             move || -> Res<PathBuf> {
-                systemd::write_unit_file(bus, &target, &text)?;
-                systemd::daemon_reload(bus)?;
+                systemd::write_units_and_reload(bus, &[(target.clone(), text)])?;
                 Ok(target)
             },
             move |res| {

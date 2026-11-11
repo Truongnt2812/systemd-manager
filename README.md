@@ -93,9 +93,9 @@ Run the tests with `cargo test`.
 | Timers dialog | `src/timers.rs` | Lists timers with their next and last run. |
 | Resources tab | `src/resources.rs` | Samples the service's cgroup counters and processes every 2 s and draws the graphs. |
 
-Writing system unit files goes through `pkexec` (one call that creates the directory and writes the file) so polkit authorizes the write. User units are written directly to `~/.config/systemd/user/`.
+Saving, creating, reverting or deleting system unit files goes through one `pkexec` call that writes (or removes) the files and runs `systemctl daemon-reload`, so you are asked for your password once per save, every time (pkexec never remembers it). User units are written directly to `~/.config/systemd/user/`.
 
 ## Notes
 
 - To read logs of system services without root, your user must be in the `systemd-journal` (or `adm`/`wheel`, depending on distro) group. Otherwise journalctl shows only your own messages.
-- Enabling/disabling and saving a unit runs daemon-reload afterwards. If your polkit rules don't cache authorization, you may be asked for your password twice.
+- Enabling and disabling go through systemd itself and run daemon-reload afterwards; if your polkit rules don't cache authorization, that can ask for your password twice.

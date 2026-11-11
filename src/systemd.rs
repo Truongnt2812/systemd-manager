@@ -5,7 +5,6 @@
 //! flag, which lets systemd ask polkit to show a password prompt.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -854,12 +853,9 @@ fn overrides_in(
     out
 }
 
-/// Deletes files and directories, through pkexec for system units (unless we
-/// already run as root).
-pub fn remove_files(bus: Bus, paths: &[PathBuf]) -> Res<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
+/// Deletes files and directories, then reloads systemd. For system units both happen
+/// in one pkexec call (unless we already run as root), so polkit asks only once.
+pub fn remove_files_and_reload(bus: Bus, paths: &[PathBuf]) -> Res<()> {
     if bus == Bus::User || running_as_root() {
         for p in paths {
             let res = if p.is_dir() {
@@ -873,10 +869,15 @@ pub fn remove_files(bus: Bus, paths: &[PathBuf]) -> Res<()> {
                 Err(e) => return Err(format!("{}: {e}", p.display())),
             }
         }
-        return Ok(());
+        return daemon_reload(bus);
     }
     let out = Command::new("pkexec")
-        .args(["rm", "-rf", "--"])
+        .args([
+            "/bin/sh",
+            "-c",
+            r#"rm -rf -- "$@" && systemctl daemon-reload"#,
+            "sh",
+        ])
         .args(paths)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -937,8 +938,7 @@ pub fn delete_service(bus: Bus, name: &str, fragment: &str, running: bool) -> Re
     names.extend(timer);
     // Fails harmlessly for units that have no [Install] section.
     let _: Res<Vec<(String, String, String)>> = call_auth(&m, "DisableUnitFiles", &(&names, false));
-    remove_files(bus, &unit_files(bus, name, fragment))?;
-    daemon_reload(bus)?;
+    remove_files_and_reload(bus, &unit_files(bus, name, fragment))?;
     // Forget a failed state, so the unit disappears from the list.
     let _: Res<()> = call_auth(&m, "ResetFailedUnit", &(name,));
     Ok(())
@@ -958,38 +958,70 @@ pub fn read_file(path: &str) -> Res<String> {
     std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))
 }
 
-/// Writes a unit file. System units are written through pkexec so polkit can authorize it
-/// (unless we already run as root).
-pub fn write_unit_file(bus: Bus, path: &Path, content: &str) -> Res<()> {
+/// Writes unit files (path, content) and reloads systemd. For system units this is a
+/// single pkexec call, so polkit asks for the password once per save (pkexec never
+/// remembers it); as root or for user units it writes directly.
+pub fn write_units_and_reload(bus: Bus, files: &[(PathBuf, String)]) -> Res<()> {
     if bus == Bus::User || running_as_root() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(err)?;
+        for (path, content) in files {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(err)?;
+            }
+            std::fs::write(path, content).map_err(|e| format!("{}: {e}", path.display()))?;
         }
-        return std::fs::write(path, content).map_err(|e| format!("{}: {e}", path.display()));
+        return daemon_reload(bus);
     }
-    // One pkexec call creates the parent directory (needed for new drop-ins) and
-    // writes the file, so polkit asks only once.
-    let mut child = Command::new("pkexec")
-        .args([
+    // Stage each file in a private temp file that root then copies into place.
+    // `cat >` (rather than mv) keeps the target's owner and SELinux label.
+    let dir = std::env::temp_dir().join(format!("systemd-manager-{}", std::process::id()));
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // Only we (and root) may read the staged files: units can hold secrets.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .or_else(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => Ok(()),
+                _ => Err(e),
+            })
+            .map_err(err)?;
+    }
+    let staged: Res<Vec<PathBuf>> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (_, content))| {
+            let tmp = dir.join(format!("unit-{i}"));
+            std::fs::write(&tmp, content).map_err(err)?;
+            Ok(tmp)
+        })
+        .collect();
+    let result = staged.and_then(|staged| {
+        let mut cmd = Command::new("pkexec");
+        cmd.args([
             "/bin/sh",
             "-c",
-            r#"mkdir -p -- "$(dirname -- "$1")" && cat > "$1""#,
+            r#"set -e
+while [ $# -gt 0 ]; do
+    mkdir -p -- "$(dirname -- "$2")"
+    cat -- "$1" > "$2"
+    shift 2
+done
+systemctl daemon-reload"#,
             "sh",
-        ])
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not run pkexec: {e}"))?;
-    child
-        .stdin
-        .take()
-        .expect("stdin is piped")
-        .write_all(content.as_bytes())
-        .map_err(err)?;
-    let out = child.wait_with_output().map_err(err)?;
-    pkexec_result(&out)
+        ]);
+        for (tmp, (path, _)) in staged.iter().zip(files) {
+            cmd.arg(tmp).arg(path);
+        }
+        let out = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("could not run pkexec: {e}"))?;
+        pkexec_result(&out)
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 fn running_as_root() -> bool {

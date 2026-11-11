@@ -282,11 +282,11 @@ pub fn show(win: &Rc<Window>) {
         let created = unit_name.clone();
         background(
             move || -> systemd::Res<Vec<String>> {
-                systemd::write_unit_file(bus, &path, &content)?;
+                let mut files = vec![(path.clone(), content)];
                 if let Some(timer) = &timer {
-                    systemd::write_unit_file(bus, &timer_path, timer)?;
+                    files.push((timer_path.clone(), timer.clone()));
                 }
-                systemd::daemon_reload(bus)?;
+                systemd::write_units_and_reload(bus, &files)?;
                 // With a schedule, the timer is what gets enabled and started.
                 let target = if timer.is_some() {
                     timer_name.as_str()
