@@ -76,6 +76,26 @@
     <binary>systemd-manager</binary>
   </provides>
   <releases>
+    <release version="0.2.0" date="2026-11-11">
+      <description>
+        <ul>
+          <li>Edits to vendor units are saved as drop-in overrides, with Show Original and Revert to Vendor</li>
+          <li>Asks before discarding unsaved unit file edits, and before risky actions on system services</li>
+          <li>Delete services you created</li>
+          <li>Journal filters (priority, boot, time range) and saving the log to a file</li>
+          <li>Why a service failed, CPU time, tasks, restarts, and Reset Failed</li>
+          <li>Timers list, and scheduled services with a timer from the New service form</li>
+          <li>Command checks, environment variables, ExecStop and all restart policies in the New service form</li>
+          <li>Resources tab with live CPU and memory graphs and the service's processes, heaviest first</li>
+          <li>Sort the service list by CPU or memory use</li>
+          <li>CPU and memory figures explained the way other system monitors show them</li>
+          <li>One password prompt for each save of a system unit file</li>
+          <li>Preferences for light or dark style and the interface and monospace fonts</li>
+          <li>Faster service list, keyboard shortcuts, and syntax highlighting for unit files</li>
+          <li>Reconnects by itself when the system bus restarts</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-13">
       <description>
         <p>First release.</p>
