@@ -25,7 +25,7 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 | Ctrl+F | Search services (or the log, on the Journal tab) |
 | Ctrl+N | New service |
 | Ctrl+T | Timers |
-| F5 | Refresh |
+| F5 | Reload the list and the selected service (rarely needed: both update by themselves) |
 | Ctrl+1 / Ctrl+2 | System / User services |
 | Ctrl+Shift+S, Ctrl+Shift+X, Ctrl+R | Start, Stop, Restart the selected service |
 | Ctrl+S | Save the unit file and reload |

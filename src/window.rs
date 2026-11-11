@@ -28,7 +28,7 @@ const SHORTCUTS_UI: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child><object class="GtkShortcutsShortcut"><property name="title">Search services, or the log on the Journal tab</property><property name="accelerator">&lt;Ctrl&gt;f</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">New service</property><property name="accelerator">&lt;Ctrl&gt;n</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Timers</property><property name="accelerator">&lt;Ctrl&gt;t</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="title">Refresh</property><property name="accelerator">F5</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Reload (the list updates by itself)</property><property name="accelerator">F5</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">System services</property><property name="accelerator">&lt;Ctrl&gt;1</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">User services</property><property name="accelerator">&lt;Ctrl&gt;2</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Keyboard shortcuts</property><property name="accelerator">&lt;Ctrl&gt;question</property></object></child>
@@ -408,10 +408,6 @@ impl Window {
         bus_box.append(&system_btn);
         bus_box.append(&user_btn);
 
-        let refresh_btn = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Refresh")
-            .build();
         let new_btn = gtk::Button::builder()
             .icon_name("list-add-symbolic")
             .tooltip_text("New service")
@@ -422,7 +418,6 @@ impl Window {
             .build();
         let side_header = adw::HeaderBar::new();
         side_header.set_title_widget(Some(&bus_box));
-        side_header.pack_start(&refresh_btn);
         side_header.pack_start(&timers_btn);
         let main_menu = gio::Menu::new();
         main_menu.append(Some("_Keyboard Shortcuts"), Some("win.show-help-overlay"));
@@ -910,13 +905,6 @@ impl Window {
                     Bus::User => w.user_btn.set_active(true),
                 },
             );
-        });
-        let weak = Rc::downgrade(&w);
-        refresh_btn.connect_clicked(move |_| {
-            if let Some(w) = weak.upgrade() {
-                w.refresh_list();
-                w.load_details(false);
-            }
         });
         let weak = Rc::downgrade(&w);
         timers_btn.connect_clicked(move |_| {
