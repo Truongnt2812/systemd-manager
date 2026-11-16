@@ -10,8 +10,8 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 - Updates by itself when services change outside the app (systemctl, crashes, package updates), using systemd's change signals. If the bus connection drops (for example when D-Bus or the user manager restarts), the app reconnects by itself and catches up.
 - Switches between **System** services and your own **User** services.
 - **Start, Stop, Restart, Reload, Enable, Disable, Mask, Unmask, Reset Failed**. On system services, the polkit password prompt appears when systemd needs it. Masking a system service, or stopping, restarting or disabling one the system depends on (SSH, networking, the display manager, D-Bus and the like), asks you to confirm first.
-- **Status** shows active/sub state, why the service last stopped or failed (its result and the main process's exit code or signal), unit file state, active since, main PID, memory, CPU time, tasks, automatic restarts, and the unit file path. **Reset Failed** clears a failed state and the restart counter.
-- **Resources** shows live graphs of the service's CPU (percent of one core) and memory over the last 3 minutes, its memory peak and limit, tasks, disk read and written, and its processes with the heaviest first. It samples every 2 seconds, from the counters systemd keeps for the service's cgroup and from `/proc`.
+- **Status** shows active/sub state, why the service last stopped or failed (its result and the main process's exit code or signal), unit file state, active since, main PID, memory, CPU time, tasks, automatic restarts, and the unit file path. Memory is split into the processes' own memory and the kernel's file cache, which systemd counts too but frees when needed. **Reset Failed** clears a failed state and the restart counter.
+- **Resources** shows live graphs of the service's CPU and memory over the last 3 minutes, its memory peak and limit, tasks, disk read and written, and its processes with the heaviest first. CPU reads like `43.8 % of one core (0.9 % of all 48 CPUs)`, so the numbers line up with GNOME System Monitor and similar tools, which show a share of all CPUs. Memory is split into process memory and file cache, from the cgroup's `memory.stat`. It samples every 2 seconds, from the counters systemd keeps for the service's cgroup and from `/proc`.
 - **Journal** streams the unit's log live, starting from the last 100 to 10,000 lines. **Pause** freezes the view and keeps new lines until you **Resume**. **Find in log** highlights every match; Enter and Shift+Enter (or the arrows) jump between them. **Filters** narrows the log by priority (warnings and errors, or errors only), to the current boot, or to a recent time range, and the save button writes the log to a file.
 - **Unit File** lets you view and edit the unit with syntax highlighting and line numbers, then **Save and Reload**, which writes the file and runs daemon-reload. Vendor units (e.g. under `/usr/lib/systemd`) are never modified in place. For those, the editor holds a drop-in override (`/etc/systemd/system/<unit>.d/override.conf`, or under `~/.config/systemd/user/`), the way `systemctl edit` does, so package updates to the unit still apply. **Show Original** shows the packaged file, and **Revert to Vendor** deletes your overrides. If you switch to another service or close the window with unsaved edits, the app asks before discarding them.
 - **New service** (the + button) creates a `.service` unit from a form (command, stop command, environment variables, type, restart policy and delay, working directory, user, WantedBy). It checks that the command exists and is executable, and turns a bare command name like `python3` into its full path. It can also enable and start the service right away. Turn on **Run on a schedule** to also create a matching `.timer` with an `OnCalendar=` schedule (checked with `systemd-analyze calendar`), for jobs that should run daily, hourly and so on.
@@ -33,6 +33,7 @@ A GTK4 / libadwaita desktop app, written in Rust, for managing systemd services.
 | Ctrl+P | Pause or resume the journal |
 | Alt+1 / Alt+2 / Alt+3 / Alt+4 | Status / Resources / Journal / Unit File tab |
 | Ctrl+, | Preferences |
+| Ctrl+W | Close the window |
 | Ctrl+? | Show all shortcuts |
 
 ## Requirements
@@ -56,6 +57,17 @@ sudo pacman -S base-devel gtk4 libadwaita gtksourceview5
 
 ## Install
 
+### From a release
+
+Each [GitHub release](https://github.com/Truongnt2812/systemd-manager/releases) has a `.deb` (built on Ubuntu 24.04) and an `.rpm` (built on Fedora). Download the one for your distro and install it with its dependencies:
+
+```sh
+sudo apt install ./systemd-manager_*.deb     # Ubuntu / Debian
+sudo dnf install ./systemd-manager-*.rpm     # Fedora
+```
+
+### From source
+
 ```sh
 ./install.sh            # for all users, into /usr/local (asks for sudo)
 ./install.sh --user     # just for you, into ~/.local (no sudo)
@@ -65,7 +77,7 @@ To remove it, run `bash uninstall.sh`. It finds every installed copy (in `~/.loc
 
 The script installs missing build dependencies with your package manager (apt, dnf, pacman or zypper), updates Rust through rustup if it is too old, builds a release binary, and installs it with a desktop entry, icon and AppStream metainfo, so Systemd Manager shows up in your app menu and software centers can describe it. If the file isn't executable after unpacking, run it as `bash install.sh`.
 
-### Packages
+### Build the packages yourself
 
 ```sh
 cargo install cargo-deb && cargo deb                                          # target/debian/*.deb
@@ -90,10 +102,11 @@ Run the tests with `cargo test`.
 | --- | --- | --- |
 | systemd API | `src/systemd.rs` | Talks to `org.freedesktop.systemd1` over D-Bus with `zbus`, and listens for its change signals. Privileged calls set the *allow interactive authorization* flag so polkit can prompt. |
 | Journal | `src/journal.rs` | Runs `journalctl -f -u <unit>` (with `--user` for user services) and streams its output into the view. |
-| Main window | `src/window.rs` | Holds the list, the status, journal and unit file tabs, and the action buttons. The list is a `GtkListView` that creates rows only for what is on screen and updates changed services in place. D-Bus calls run on worker threads, so the UI never blocks. |
+| Main window | `src/window.rs` | Holds the list, the Status, Resources, Journal and Unit File tabs, and the action buttons. The list is a `GtkListView` that creates rows only for what is on screen and updates changed services in place. D-Bus calls run on worker threads, so the UI never blocks. |
 | New service dialog | `src/new_service.rs` | Renders the form into a unit file (and a timer, when scheduled), writes it, runs daemon-reload, then optionally enables and starts it. |
 | Timers dialog | `src/timers.rs` | Lists timers with their next and last run. |
-| Resources tab | `src/resources.rs` | Samples the service's cgroup counters and processes every 2 s and draws the graphs. |
+| Resources tab | `src/resources.rs` | Samples the service's cgroup counters and processes every 2 s, draws the graphs, and words the CPU and memory numbers. |
+| Preferences | `src/preferences.rs` | The style and font settings, saved in `~/.config/systemd-manager/settings.ini` and applied at startup. |
 
 Saving, creating, reverting or deleting system unit files goes through one `pkexec` call that writes (or removes) the files and runs `systemctl daemon-reload`, so you are asked for your password once per save, every time (pkexec never remembers it). User units are written directly to `~/.config/systemd/user/`.
 
@@ -101,3 +114,7 @@ Saving, creating, reverting or deleting system unit files goes through one `pkex
 
 - To read logs of system services without root, your user must be in the `systemd-journal` (or `adm`/`wheel`, depending on distro) group. Otherwise journalctl shows only your own messages.
 - Enabling and disabling go through systemd itself and run daemon-reload afterwards; if your polkit rules don't cache authorization, that can ask for your password twice.
+
+## License
+
+MIT
